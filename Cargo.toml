@@ -1,0 +1,41 @@
+[package]
+name = "project-launcher"
+version = "0.1.0"
+edition = "2024"
+description = "Windows launcher that starts groups of apps, folders, files, URLs and commands per profile"
+
+[[bin]]
+name = "ProjectLauncher"
+path = "src/main.rs"
+
+[dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    # Only for the HBRUSH type in WNDCLASSW; no GDI call is made.
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+# Size-optimized: LTO + single codegen unit lets LLVM dead-strip unused
+# windows-sys/serde code paths. panic="abort" is intentionally NOT set:
+# with unwind, a panicking profile worker only kills its own thread and the
+# resident process survives; abort would take down the whole resident.
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
