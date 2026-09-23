@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "profiles": [
+    {
+      "id": "{11111111-2222-3333-4444-555555555555}",
+      "name": "Development",
+      "actions": [
+        {
+          "id": "open-docs",
+          "type": "url",
+          "url": "https://github.com"
+        },
+        {
+          "id": "open-folder",
+          "type": "folder",
+          "path": "C:\\Example\\Project"
+        },
+        {
+          "id": "wait-a-bit",
+          "type": "wait",
+          "milliseconds": 500
+        },
+        {
+          "id": "edit-notes",
+          "type": "application",
+          "path": "C:\\Windows\\System32\\notepad.exe",
+          "arguments": "C:\\Example\\notes.txt",
+          "disabled": true
+        },
+        {
+          "id": "show-date",
+          "type": "command",
+          "shell": "powershell",
+          "command": "Get-Date"
+        }
+      ]
+    }
+  ]
+}
