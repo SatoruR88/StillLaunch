@@ -85,3 +85,7 @@ cargo test
 ## License / ライセンス
 
 Released under the MIT License. MITライセンスで公開しています。
+
+## Personal profiles
+
+Personal application profiles and private handoff material are preserved only in the owner's private `project-launcher-personal` repository. This public repository contains the application source and public example configuration only.
