@@ -2,86 +2,65 @@
 
 [English](#english) · [日本語](#日本語)
 
+> **Note:** this branch is a from-scratch rewrite (raw Win32, no serde) that has **not been compiled or tested on Windows yet**.
+> **注意:** このブランチは作り直したコード（Win32 直接・serde なし）で、**まだ Windows でビルド・動作確認していません**。
+
 ## English
 
-StillLaunch is a Windows launcher for running groups of apps and other actions from saved profiles.
+StillLaunch runs a saved list of steps — start apps, open folders, files and URLs, run `cmd`/PowerShell commands, wait — with one click, a shortcut or the tray.
 
-### Features
-
-- Create, edit, and run profiles in the built-in window.
-- Launch applications, open folders and files, visit URLs, run `cmd` or PowerShell commands, and add wait steps.
-- Create profile shortcuts on the Desktop or in the Start menu.
-- Run in resident mode with a tray icon, or start the resident process when Windows starts.
+- One-window editor: profiles on the left, the selected profile's steps and a step form on the right.
+- Desktop / Start-menu shortcut per profile.
+- Optional tray resident (right-click: run a profile, edit, exit), optionally started with Windows.
+- Single dependency (`windows-sys`); the resident sleeps in `GetMessageW` and does nothing while idle.
 
 ### Build
 
-Requires Windows 10/11 (x64) and a Rust toolchain that supports edition 2024.
+Windows 10/11 and Rust with edition 2024: `cargo build --release` → `target\release\ProjectLauncher.exe` (`cargo test` runs the parser and CLI tests).
 
-```powershell
-cargo build --release
-cargo test
-```
+### Command line
 
-The executable is written to `target\release\ProjectLauncher.exe`.
-
-### Run
-
-| Command | Description |
+| Command | Action |
 | --- | --- |
-| `ProjectLauncher.exe` | Open the profile manager. |
-| `ProjectLauncher.exe --settings` | Open the profile manager. |
-| `ProjectLauncher.exe --profile <GUID>` | Run a profile. If resident mode is running, the request is sent to it. |
-| `ProjectLauncher.exe --resident` | Start the resident process and tray icon. |
-| `ProjectLauncher.exe --shortcut <GUID> [desktop|startmenu|both]` | Create a shortcut. The default location is the Desktop. |
+| `ProjectLauncher.exe` / `--settings` | Open the editor. |
+| `--profile <GUID>` | Run a profile (sent to the resident if one is running). Exit code 1 if a step failed. |
+| `--resident` | Start the tray resident. |
+| `--shortcut <GUID> [desktop\|startmenu\|both]` | Create a shortcut (default: desktop). |
 
 ### Configuration
 
-The configuration file is `%LOCALAPPDATA%\ProjectLauncher\config.json`. Edit profiles in the profile manager, or see [`config.example.json`](config.example.json) for the JSON format.
+`%LOCALAPPDATA%\ProjectLauncher\config.json` — edited by the editor, or by hand (see [`config.example.json`](config.example.json)). Steps run in order; a failed step does not stop the rest; launched apps are not waited for. Commands run as written under your account, so only run profiles you trust. Shortcuts and the autostart entry point at the current exe path; recreate them after moving it.
 
-Actions run in order. Starting an application does not wait for it to close; use a wait action when a fixed delay is needed. Commands run as written under your Windows account, so only run profiles you trust.
-
-Shortcuts and the Windows startup entry point to the current executable path. Recreate them if you move the executable.
+Files from the previous version load unchanged. The per-step `"id"` field is still accepted but no longer written, so a file saved by this version cannot be read by the old one.
 
 ## 日本語
 
-StillLaunch は、保存したプロファイルから複数のアプリや操作をまとめて実行する Windows 向けランチャーです。
+StillLaunch は、保存した手順（アプリ起動、フォルダ・ファイル・URL を開く、`cmd`/PowerShell コマンド、待機）をワンクリック・ショートカット・タスクトレイからまとめて実行するランチャーです。
 
-### 主な機能
-
-- プロファイルの作成・編集・実行を管理画面から行えます。
-- アプリ、フォルダ、ファイル、URLを開き、`cmd` や PowerShell のコマンドを実行できます。操作の間に待ち時間を入れることもできます。
-- プロファイルごとにデスクトップまたはスタートメニューへショートカットを作成できます。
-- 常駐モードとタスクトレイに対応しています。Windows 起動時に常駐させる設定もあります。
+- 1 画面の編集ウィンドウ：左にプロファイル一覧、右に選択中プロファイルのステップ一覧と編集欄。
+- プロファイルごとにデスクトップ／スタートメニューへショートカットを作成。
+- タスクトレイ常駐（右クリックでプロファイル実行・編集・終了）。Windows 起動時の常駐も設定可能。
+- 依存は `windows-sys` のみ。常駐中は `GetMessageW` で待機し、何もしていない間は CPU を使いません。
 
 ### ビルド
 
-Windows 10/11（x64）と、Rust 2024 Edition に対応したツールチェーンが必要です。
+Windows 10/11 と Rust（edition 2024）で `cargo build --release` → `target\release\ProjectLauncher.exe`（`cargo test` で設定ファイル読み込みと引数解析をテスト）。
 
-```powershell
-cargo build --release
-cargo test
-```
-
-実行ファイルは `target\release\ProjectLauncher.exe` に作成されます。
-
-### 起動方法
+### コマンドライン
 
 | コマンド | 動作 |
 | --- | --- |
-| `ProjectLauncher.exe` | プロファイル管理画面を開きます。 |
-| `ProjectLauncher.exe --settings` | プロファイル管理画面を開きます。 |
-| `ProjectLauncher.exe --profile <GUID>` | 指定したプロファイルを実行します。常駐中は常駐プロセスへ要求を送ります。 |
-| `ProjectLauncher.exe --resident` | 常駐プロセスとタスクトレイアイコンを起動します。 |
-| `ProjectLauncher.exe --shortcut <GUID> [desktop|startmenu|both]` | ショートカットを作成します。省略時はデスクトップに作成します。 |
+| `ProjectLauncher.exe` / `--settings` | 編集ウィンドウを開きます。 |
+| `--profile <GUID>` | プロファイルを実行します（常駐中なら常駐プロセスに渡します）。失敗したステップがあれば終了コード 1。 |
+| `--resident` | タスクトレイに常駐します。 |
+| `--shortcut <GUID> [desktop\|startmenu\|both]` | ショートカットを作成します（省略時はデスクトップ）。 |
 
 ### 設定ファイル
 
-設定ファイルは `%LOCALAPPDATA%\ProjectLauncher\config.json` です。プロファイル管理画面から編集できます。JSON形式は [`config.example.json`](config.example.json) を参照してください。
+`%LOCALAPPDATA%\ProjectLauncher\config.json`。編集ウィンドウから、または直接編集できます（[`config.example.json`](config.example.json) 参照）。ステップは上から順に実行し、失敗しても残りは続行、起動したアプリの終了は待ちません。コマンドは書かれたとおりにユーザー権限で実行されるため、信頼できるプロファイルだけを実行してください。ショートカットと自動起動は現在の exe の場所を指すので、移動したら作り直してください。
 
-アクションは記載順に実行されます。アプリの起動後、そのアプリが終了するまで待つことはありません。一定時間待つ場合は wait アクションを使ってください。コマンドは Windows のユーザー権限で設定どおりに実行されるため、信頼できるプロファイルだけを実行してください。
-
-ショートカットと Windows 起動時の登録には、実行ファイルの現在のパスが使われます。実行ファイルを移動した場合は作り直してください。
+旧バージョンの設定ファイルはそのまま読めます。各ステップの `"id"` は読み込み時に受け付けますが保存時には書かないため、このバージョンで保存したファイルは旧バージョンでは読めません。
 
 ## License / ライセンス
 
-Released under the MIT License. MITライセンスで公開しています。
+MIT License.
