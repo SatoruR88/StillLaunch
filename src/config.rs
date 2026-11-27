@@ -1,824 +1,507 @@
-//! Config model, loading and validation.
+//! Profiles: data model, validation, load/save of
+//! `%LOCALAPPDATA%\ProjectLauncher\config.json`.
 //!
-//! The config file lives at `%LOCALAPPDATA%\ProjectLauncher\config.json`.
-//! Profiles are referenced by a stable GUID, never by name. Unknown fields
-//! are rejected on purpose so typos in the config cannot silently change
-//! behavior.
+//! The file format is the one used before the rewrite (version 1), so
+//! existing files load unchanged. Unknown fields are rejected so a typo
+//! cannot silently change what a profile does. The per-action `"id"` field
+//! is still accepted on read but no longer written.
 
-use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use std::fmt;
+use crate::json::{self, Json};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
-pub const CURRENT_CONFIG_VERSION: u32 = 1;
-/// Upper bound for Wait actions (24h). Anything larger is almost certainly a
-/// misconfiguration, so it is rejected at validation time.
+/// Largest config file that will be read (1 MiB).
+const MAX_BYTES: u64 = 1 << 20;
+/// Longest allowed wait step (24 h).
 pub const MAX_WAIT_MS: u64 = 86_400_000;
-/// Upper bound for the config file size (1 MiB). The file is meant to be
-/// hand-edited JSON of a few KB at most; the cap keeps `Config::load` from
-/// reading an unbounded amount when a stray huge file sits at the config
-/// path.
-pub const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Config {
-    pub version: u32,
-    #[serde(default)]
     pub profiles: Vec<Profile>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Profile {
-    /// Stable GUID that identifies this profile (braced or bare form).
+    /// Stable GUID; shortcuts and `--profile` refer to it.
     pub id: String,
     pub name: String,
-    #[serde(default)]
-    pub actions: Vec<Action>,
+    pub steps: Vec<Step>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct Action {
-    /// Stable ID that identifies this action inside the profile.
-    pub id: String,
-    #[serde(default)]
-    pub disabled: bool,
-    #[serde(flatten)]
-    pub kind: ActionKind,
+#[derive(Debug, Clone, PartialEq)]
+pub struct Step {
+    pub off: bool,
+    pub kind: Kind,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ActionKind {
-    /// Launches an executable via CreateProcessW. `arguments` is appended to
-    /// the command line verbatim; quoting it is the user's responsibility.
-    Application {
-        path: String,
-        #[serde(default)]
-        arguments: String,
-        working_directory: Option<String>,
-    },
-    /// Opens a folder through the Windows Shell association.
-    Folder { path: String },
-    /// Opens a file through the Windows Shell association.
-    File { path: String },
-    /// Opens a URL through the Windows Shell association.
-    Url { url: String },
-    /// Runs a user-supplied command string through the selected shell.
-    /// The command is appended verbatim after `/C` / `-Command`; quoting is
-    /// the user's responsibility.
-    Command {
-        shell: CommandShell,
-        command: String,
-    },
-    /// Sleeps for the given number of milliseconds.
-    Wait { milliseconds: u64 },
+#[derive(Debug, Clone, PartialEq)]
+pub enum Kind {
+    /// `args` is appended verbatim; `dir` empty = inherit.
+    App { path: String, args: String, dir: String },
+    Folder(String),
+    File(String),
+    Url(String),
+    /// `ps` = PowerShell, otherwise cmd. `line` is passed verbatim.
+    Cmd { ps: bool, line: String },
+    Wait(u64),
 }
 
-/// Shells supported by the Command action. PowerShell 7 and others can be
-/// added later without changing the data model.
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum CommandShell {
-    Cmd,
-    #[serde(rename = "powershell")]
-    PowerShell,
-}
+/// JSON `"type"` names, in the order the editor lists them.
+pub const KINDS: [&str; 6] = ["application", "folder", "file", "url", "command", "wait"];
 
-impl CommandShell {
-    /// Path of the shell executable relative to the Windows system
-    /// directory. Resolving it against the system directory rather than
-    /// relying on PATH/CWD prevents a planted `cmd.exe` from being run.
-    pub fn system_relative_exe(self) -> &'static str {
+impl Kind {
+    pub fn index(&self) -> usize {
         match self {
-            CommandShell::Cmd => "cmd.exe",
-            CommandShell::PowerShell => r"WindowsPowerShell\v1.0\powershell.exe",
-        }
-    }
-
-    /// Arguments that precede the user's command string, including the
-    /// trailing space.
-    pub fn command_line_prefix(self) -> &'static str {
-        match self {
-            CommandShell::Cmd => "/C ",
-            CommandShell::PowerShell => "-NoProfile -Command ",
+            Kind::App { .. } => 0,
+            Kind::Folder(_) => 1,
+            Kind::File(_) => 2,
+            Kind::Url(_) => 3,
+            Kind::Cmd { .. } => 4,
+            Kind::Wait(_) => 5,
         }
     }
 }
 
-/// Why a config document failed to parse: broken JSON, or well-formed JSON
-/// whose values fail validation.
-#[derive(Debug)]
-pub enum ParseError {
-    Json(serde_json::Error),
-    Validation(String),
-}
-
-impl fmt::Display for ParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ParseError::Json(e) => write!(f, "{e}"),
-            ParseError::Validation(m) => write!(f, "{m}"),
-        }
+impl Config {
+    pub fn find(&self, id: &str) -> Option<&Profile> {
+        let key = guid_key(id);
+        self.profiles.iter().find(|p| guid_key(&p.id) == key)
     }
-}
 
-impl std::error::Error for ParseError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            ParseError::Json(e) => Some(e),
-            ParseError::Validation(_) => None,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum ConfigError {
-    /// %LOCALAPPDATA% is not set; the config location cannot be resolved.
-    NoLocalAppData,
-    Io {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    /// The file is larger than `MAX_CONFIG_BYTES`; reading is refused
-    /// before allocating, so a corrupt path cannot exhaust memory.
-    TooLarge {
-        path: PathBuf,
-        size: u64,
-    },
-    Parse {
-        path: PathBuf,
-        source: serde_json::Error,
-    },
-    /// Serialization itself failed; effectively unreachable for this model
-    /// but reported instead of panicking.
-    Serialize {
-        path: PathBuf,
-        source: serde_json::Error,
-    },
-    Validation {
-        path: PathBuf,
-        message: String,
-    },
-}
-
-impl fmt::Display for ConfigError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ConfigError::NoLocalAppData => {
-                write!(f, "%LOCALAPPDATA% is not set; cannot locate config.json")
+    pub fn validate(&self) -> Result<(), String> {
+        for (i, p) in self.profiles.iter().enumerate() {
+            if !is_guid(&p.id) {
+                return Err(format!("profile id {:?} is not a GUID", p.id));
             }
-            ConfigError::Io { path, source } => {
-                write!(f, "cannot read config file {}: {source}", path.display())
+            if self.profiles[..i].iter().any(|q| guid_key(&q.id) == guid_key(&p.id)) {
+                return Err(format!("duplicate profile id {:?}", p.id));
             }
-            ConfigError::TooLarge { path, size } => {
-                write!(
-                    f,
-                    "config file {} is too large ({size} bytes; maximum is {MAX_CONFIG_BYTES})",
-                    path.display()
-                )
+            if p.name.trim().is_empty() {
+                return Err(format!("profile {:?} has an empty name", p.id));
             }
-            ConfigError::Parse { path, source } => {
-                write!(
-                    f,
-                    "config file {} is not valid JSON: {source}",
-                    path.display()
-                )
-            }
-            ConfigError::Serialize { path, source } => {
-                write!(
-                    f,
-                    "cannot serialize config for {}: {source}",
-                    path.display()
-                )
-            }
-            ConfigError::Validation { path, message } => {
-                write!(f, "config file {} is invalid: {message}", path.display())
+            for (n, s) in p.steps.iter().enumerate() {
+                check_step(s).map_err(|e| format!("{} #{}: {e}", p.name, n + 1))?;
             }
         }
-    }
-}
-
-impl std::error::Error for ConfigError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            ConfigError::Io { source, .. } => Some(source),
-            ConfigError::Parse { source, .. } => Some(source),
-            ConfigError::Serialize { source, .. } => Some(source),
-            _ => None,
-        }
-    }
-}
-
-/// Normalizes a GUID for comparison by removing one surrounding brace pair
-/// — only when both braces are present — and upper-casing. Shared by
-/// `is_valid_guid`, the duplicate check in `Config::validate` and
-/// `profile::find_profile` so all three agree on which strings name the
-/// same profile.
-pub(crate) fn guid_key(s: &str) -> String {
-    s.strip_prefix('{')
-        .and_then(|t| t.strip_suffix('}'))
-        .unwrap_or(s)
-        .to_ascii_uppercase()
-}
-
-/// Returns true for `XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX`, with or without
-/// one pair of surrounding braces. Mismatched braces can never pass: a
-/// brace kept by `guid_key` is neither a hex digit nor a `-` separator.
-pub fn is_valid_guid(s: &str) -> bool {
-    let inner = guid_key(s);
-    let bytes = inner.as_bytes();
-    if bytes.len() != 36 {
-        return false;
-    }
-    for (i, &b) in bytes.iter().enumerate() {
-        let is_separator = matches!(i, 8 | 13 | 18 | 23);
-        if is_separator != (b == b'-') {
-            return false;
-        }
-        if !is_separator && !b.is_ascii_hexdigit() {
-            return false;
-        }
-    }
-    true
-}
-
-fn validate_no_nul(field: &str, value: &str) -> Result<(), String> {
-    if value.contains('\0') {
-        Err(format!("{field} contains an interior NUL byte"))
-    } else {
         Ok(())
     }
+
+    pub fn parse(text: &str) -> Result<Config, String> {
+        let root = json::parse(text.strip_prefix('\u{feff}').unwrap_or(text))?;
+        let f = fields(&root, "config", &["version", "profiles"])?;
+        if get(f, "version") != Some(&Json::Num(1)) {
+            return Err("unsupported or missing \"version\" (expected 1)".into());
+        }
+        let profiles = match get(f, "profiles") {
+            None => Vec::new(),
+            Some(Json::Arr(a)) => a.iter().map(parse_profile).collect::<Result<_, _>>()?,
+            Some(_) => return Err("\"profiles\" must be an array".into()),
+        };
+        let c = Config { profiles };
+        c.validate()?;
+        Ok(c)
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut o = String::from("{\n  \"version\": 1,\n  \"profiles\": [");
+        for (i, p) in self.profiles.iter().enumerate() {
+            o.push_str(if i == 0 { "\n    {\n      \"id\": " } else { ",\n    {\n      \"id\": " });
+            json::write_str(&mut o, &p.id);
+            o.push_str(",\n      \"name\": ");
+            json::write_str(&mut o, &p.name);
+            o.push_str(",\n      \"actions\": [");
+            for (j, s) in p.steps.iter().enumerate() {
+                o.push_str(if j == 0 { "\n        " } else { ",\n        " });
+                write_step(&mut o, s);
+            }
+            o.push_str(if p.steps.is_empty() { "]\n    }" } else { "\n      ]\n    }" });
+        }
+        o.push_str(if self.profiles.is_empty() { "]\n}\n" } else { "\n  ]\n}\n" });
+        o
+    }
+
+    /// Validates, then writes through a temp file + rename so a crash
+    /// cannot leave a truncated config behind.
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        self.validate()?;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, self.to_json()).map_err(|e| format!("{}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("{}: {e}", path.display())
+        })
+    }
 }
 
-/// Validates a single action. Shared by `Config::validate` and the GUI's
-/// action editor, which needs per-action errors before the whole profile is
-/// assembled.
-pub(crate) fn validate_action(action: &Action) -> Result<(), String> {
-    if action.id.is_empty() {
-        return Err("action id must not be empty".to_string());
-    }
-    match &action.kind {
-        ActionKind::Application {
-            path,
-            arguments,
-            working_directory,
-        } => {
+/// Checks one step. Shared by `Config::validate` and the editor.
+pub fn check_step(s: &Step) -> Result<(), String> {
+    match &s.kind {
+        Kind::App { path, dir, .. } => {
             if path.is_empty() {
-                return Err("application path must not be empty".to_string());
+                return Err("path is empty".into());
             }
-            // Mirror `actions::build_command_line`: the path is wrapped in
-            // double quotes at launch time, so a stored path that breaks
-            // that quoting could never run. Rejecting it here keeps a
-            // guaranteed-to-fail setting out of the config.
-            if path.contains('"') {
-                return Err(format!(
-                    "application path must not contain a quote: {path:?}"
-                ));
+            // The path is wrapped in quotes at launch; a quote or a trailing
+            // separator (`"C:\dir\"`) would break that.
+            if path.contains('"') || path.ends_with(['\\', '/']) {
+                return Err(format!("invalid program path {path:?}"));
             }
-            if path.ends_with('\\') || path.ends_with('/') {
-                return Err(format!(
-                    "application path must not end with a path separator: {path:?}"
-                ));
-            }
-            validate_no_nul("application path", path)?;
-            validate_no_nul("application arguments", arguments)?;
-            if let Some(dir) = working_directory {
-                if dir.is_empty() {
-                    return Err("working_directory must not be empty".to_string());
-                }
-                // A relative working directory would be resolved against
-                // the launcher's own current directory at run time, which
-                // is almost never what the user intended to store.
-                if !is_absolute_windows_path(dir) {
-                    return Err(format!(
-                        "working_directory must be an absolute path (e.g. C:\\dir or \\\\server\\share): {dir:?}"
-                    ));
-                }
-                validate_no_nul("working_directory", dir)?;
+            if !dir.is_empty() && !is_absolute(dir) {
+                return Err(format!("working directory must be absolute: {dir:?}"));
             }
         }
-        ActionKind::Folder { path } | ActionKind::File { path } => {
-            if path.is_empty() {
-                return Err("path must not be empty".to_string());
-            }
-            validate_no_nul("path", path)?;
-        }
-        ActionKind::Url { url } => {
-            if url.is_empty() {
-                return Err("url must not be empty".to_string());
-            }
-            validate_no_nul("url", url)?;
-            if !has_uri_scheme(url) {
-                return Err(format!("url {url:?} has no scheme (e.g. https:)"));
+        Kind::Folder(t) | Kind::File(t) | Kind::Cmd { line: t, .. } => {
+            if t.is_empty() {
+                return Err("value is empty".into());
             }
         }
-        ActionKind::Command { command, .. } => {
-            if command.is_empty() {
-                return Err("command must not be empty".to_string());
+        Kind::Url(u) => {
+            // A real scheme has 2+ chars, so `C:\x` is not taken for one.
+            let scheme = u.split_once(':').map_or("", |(s, _)| s);
+            let ok = scheme.len() > 1
+                && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+                && scheme.chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c));
+            if !ok {
+                return Err(format!("URL needs a scheme such as https: {u:?}"));
             }
-            validate_no_nul("command", command)?;
         }
-        ActionKind::Wait { milliseconds } => {
-            if *milliseconds > MAX_WAIT_MS {
-                return Err(format!(
-                    "wait of {milliseconds}ms exceeds the maximum of {MAX_WAIT_MS}ms"
-                ));
+        Kind::Wait(ms) => {
+            if *ms > MAX_WAIT_MS {
+                return Err(format!("wait is longer than {MAX_WAIT_MS} ms"));
             }
         }
     }
     Ok(())
 }
 
-/// True when `url` starts with a real URI scheme per RFC 3986
-/// (`ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`).
-///
-/// Single-letter schemes are rejected on purpose: `C:\dir` would otherwise
-/// look like scheme `C`, so a local path pasted into a URL action would be
-/// handed to ShellExecuteW as a protocol. Such paths belong in a
-/// `file`/`folder` action instead.
-fn has_uri_scheme(url: &str) -> bool {
-    match url.find(':') {
-        Some(0) | Some(1) | None => false,
-        Some(i) => url[..i].chars().enumerate().all(|(n, c)| {
-            c.is_ascii_alphabetic()
-                || (n > 0 && (c.is_ascii_digit() || matches!(c, '+' | '-' | '.')))
-        }),
-    }
+pub fn path() -> Result<PathBuf, String> {
+    let base = std::env::var_os("LOCALAPPDATA").ok_or("%LOCALAPPDATA% is not set")?;
+    Ok(PathBuf::from(base).join("ProjectLauncher").join("config.json"))
 }
 
-/// True for `X:\...` / `X:/...` with an ASCII drive letter, or a `\\...`
-/// UNC path. `C:foo` (drive-relative) and plain relative paths return
-/// false on purpose: they would resolve against whatever current
-/// directory the launcher happens to have at run time.
-fn is_absolute_windows_path(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    if bytes.starts_with(b"\\\\") {
-        return true;
+pub fn load(path: &Path) -> Result<Config, String> {
+    let at = |e: String| format!("{}: {e}", path.display());
+    let size = std::fs::metadata(path).map_err(|e| at(e.to_string()))?.len();
+    if size > MAX_BYTES {
+        return Err(at(format!("file is larger than {MAX_BYTES} bytes")));
     }
-    bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && matches!(bytes[2], b'\\' | b'/')
+    let text = std::fs::read_to_string(path).map_err(|e| at(e.to_string()))?;
+    Config::parse(&text).map_err(at)
 }
 
-impl Config {
-    /// Parses and validates a config document.
-    pub fn parse(json: &str) -> Result<Config, ParseError> {
-        let config: Config = serde_json::from_str(json).map_err(ParseError::Json)?;
-        config.validate().map_err(ParseError::Validation)?;
-        Ok(config)
-    }
+pub fn load_default() -> Result<Config, String> {
+    load(&path()?)
+}
 
-    pub fn validate(&self) -> Result<(), String> {
-        if self.version != CURRENT_CONFIG_VERSION {
-            return Err(format!(
-                "unsupported config version {} (supported: {CURRENT_CONFIG_VERSION})",
-                self.version
-            ));
-        }
-        let mut profile_ids = HashSet::with_capacity(self.profiles.len());
-        for profile in &self.profiles {
-            if !is_valid_guid(&profile.id) {
-                return Err(format!("profile id {:?} is not a valid GUID", profile.id));
-            }
-            if !profile_ids.insert(guid_key(&profile.id)) {
-                return Err(format!("duplicate profile id {:?}", profile.id));
-            }
-            if profile.name.trim().is_empty() {
-                return Err(format!("profile {:?} has an empty name", profile.id));
-            }
-            let mut action_ids = HashSet::with_capacity(profile.actions.len());
-            for action in &profile.actions {
-                validate_action(action).map_err(|m| format!("profile {:?}: {m}", profile.id))?;
-                if !action_ids.insert(&action.id) {
-                    return Err(format!(
-                        "profile {:?}: duplicate action id {:?}",
-                        profile.id, action.id
-                    ));
-                }
-            }
-        }
-        Ok(())
-    }
+pub fn mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
 
-    /// Loads and validates the config from an explicit path.
-    pub fn load(path: &Path) -> Result<Config, ConfigError> {
-        // Check the size before reading so a bogus huge file at the
-        // config path cannot be slurped into memory unbounded.
-        let size = std::fs::metadata(path)
-            .map_err(|source| ConfigError::Io {
-                path: path.to_path_buf(),
-                source,
-            })?
-            .len();
-        if size > MAX_CONFIG_BYTES {
-            return Err(ConfigError::TooLarge {
-                path: path.to_path_buf(),
-                size,
-            });
-        }
-        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        // Tolerate a UTF-8 BOM: Notepad's "UTF-8 with BOM" save adds one
-        // and serde_json refuses to parse it.
-        let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
-        Self::parse(text).map_err(|e| match e {
-            ParseError::Json(source) => ConfigError::Parse {
-                path: path.to_path_buf(),
-                source,
-            },
-            ParseError::Validation(message) => ConfigError::Validation {
-                path: path.to_path_buf(),
-                message,
-            },
+/// Upper-case GUID without one pair of surrounding braces, so `{X}` and `x`
+/// name the same profile.
+fn guid_key(s: &str) -> String {
+    s.strip_prefix('{').and_then(|t| t.strip_suffix('}')).unwrap_or(s).to_ascii_uppercase()
+}
+
+/// `XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX`, optionally in braces.
+pub fn is_guid(s: &str) -> bool {
+    let k = guid_key(s);
+    k.len() == 36
+        && k.bytes().enumerate().all(|(i, b)| {
+            if matches!(i, 8 | 13 | 18 | 23) { b == b'-' } else { b.is_ascii_hexdigit() }
         })
-    }
+}
 
-    /// Loads and validates the config from the default location.
-    pub fn load_default() -> Result<Config, ConfigError> {
-        Self::load(&config_path()?)
-    }
+/// `X:\...` or `\\server\...`.
+fn is_absolute(p: &str) -> bool {
+    let b = p.as_bytes();
+    p.starts_with("\\\\")
+        || (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/'))
+}
 
-    /// Validates and writes the config to `path`. The write goes through a
-    /// sibling temp file renamed over the target so a crash mid-write cannot
-    /// leave a truncated config; `fs::rename` replaces the destination on
-    /// Windows.
-    pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
-        self.validate().map_err(|message| ConfigError::Validation {
-            path: path.to_path_buf(),
-            message,
-        })?;
-        let text = serde_json::to_string_pretty(self).map_err(|source| ConfigError::Serialize {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|source| ConfigError::Io {
-                path: dir.to_path_buf(),
-                source,
-            })?;
+/// File name for a profile's .lnk: the name with characters Windows forbids
+/// replaced, plus the first 8 GUID digits so two profiles never collide.
+pub fn shortcut_file_name(p: &Profile) -> String {
+    let mut name: String = p
+        .name
+        .chars()
+        .take(80)
+        .map(|c| if c < ' ' || "<>:\"/\\|?*".contains(c) { '_' } else { c })
+        .collect();
+    name.truncate(name.trim_end_matches(['.', ' ']).len());
+    let stem = name.split('.').next().unwrap_or("").trim_end().to_ascii_uppercase();
+    let sb = stem.as_bytes();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (sb.len() == 4 && (stem.starts_with("COM") || stem.starts_with("LPT")) && (b'1'..=b'9').contains(&sb[3]));
+    if name.is_empty() || reserved {
+        name.insert(0, '_');
+    }
+    let tag: String = guid_key(&p.id).chars().take(8).collect::<String>().to_ascii_lowercase();
+    format!("{name}-{tag}.lnk")
+}
+
+// ---- JSON -> model -------------------------------------------------------
+
+type Fields = [(String, Json)];
+
+/// The object's fields, after checking that every key is known and unique.
+fn fields<'a>(v: &'a Json, what: &str, allowed: &[&str]) -> Result<&'a Fields, String> {
+    let Json::Obj(f) = v else {
+        return Err(format!("{what} must be an object"));
+    };
+    for (i, (k, _)) in f.iter().enumerate() {
+        if !allowed.contains(&k.as_str()) {
+            return Err(format!("{what}: unknown field {k:?}"));
         }
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, text).map_err(|source| ConfigError::Io {
-            path: tmp.clone(),
-            source,
-        })?;
-        if let Err(source) = std::fs::rename(&tmp, path) {
-            // Best-effort cleanup so a failed save does not leave a stray
-            // config.json.tmp next to the real config; the rename error is
-            // the one worth reporting.
-            let _ = std::fs::remove_file(&tmp);
-            return Err(ConfigError::Io {
-                path: path.to_path_buf(),
-                source,
-            });
+        if f[..i].iter().any(|(k2, _)| k2 == k) {
+            return Err(format!("{what}: duplicate field {k:?}"));
         }
-        Ok(())
+    }
+    Ok(f)
+}
+
+fn get<'a>(f: &'a Fields, key: &str) -> Option<&'a Json> {
+    f.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+}
+
+/// String field; `Ok(None)` when absent or null.
+fn opt_str(f: &Fields, key: &str) -> Result<Option<String>, String> {
+    match get(f, key) {
+        None | Some(Json::Null) => Ok(None),
+        Some(Json::Str(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(format!("\"{key}\" must be a string")),
     }
 }
 
-/// `%LOCALAPPDATA%\ProjectLauncher\config.json`
-pub fn config_path() -> Result<PathBuf, ConfigError> {
-    let base = std::env::var_os("LOCALAPPDATA").ok_or(ConfigError::NoLocalAppData)?;
-    Ok(PathBuf::from(base)
-        .join("ProjectLauncher")
-        .join("config.json"))
+fn req_str(f: &Fields, key: &str) -> Result<String, String> {
+    opt_str(f, key)?.ok_or_else(|| format!("missing \"{key}\""))
+}
+
+fn parse_profile(v: &Json) -> Result<Profile, String> {
+    let f = fields(v, "profile", &["id", "name", "actions"])?;
+    let id = req_str(f, "id")?;
+    let name = req_str(f, "name")?;
+    let steps = match get(f, "actions") {
+        None => Vec::new(),
+        Some(Json::Arr(a)) => a
+            .iter()
+            .map(parse_step)
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("profile {name:?}: {e}"))?,
+        Some(_) => return Err(format!("profile {name:?}: \"actions\" must be an array")),
+    };
+    Ok(Profile { id, name, steps })
+}
+
+fn parse_step(v: &Json) -> Result<Step, String> {
+    let Json::Obj(raw) = v else {
+        return Err("action must be an object".into());
+    };
+    let ty = req_str(raw, "type")?;
+    let extra: &[&str] = match ty.as_str() {
+        "application" => &["path", "arguments", "working_directory"],
+        "folder" | "file" => &["path"],
+        "url" => &["url"],
+        "command" => &["shell", "command"],
+        "wait" => &["milliseconds"],
+        _ => return Err(format!("unknown action type {ty:?}")),
+    };
+    let allowed: Vec<&str> = ["id", "type", "disabled"].iter().chain(extra).copied().collect();
+    let f = fields(v, &format!("{ty} action"), &allowed)?;
+    if get(f, "id").is_some_and(|id| !matches!(id, Json::Str(_))) {
+        return Err("\"id\" must be a string".into());
+    }
+    let off = match get(f, "disabled") {
+        None => false,
+        Some(Json::Bool(b)) => *b,
+        Some(_) => return Err("\"disabled\" must be true or false".into()),
+    };
+    let kind = match ty.as_str() {
+        "application" => Kind::App {
+            path: req_str(f, "path")?,
+            args: opt_str(f, "arguments")?.unwrap_or_default(),
+            dir: opt_str(f, "working_directory")?.unwrap_or_default(),
+        },
+        "folder" => Kind::Folder(req_str(f, "path")?),
+        "file" => Kind::File(req_str(f, "path")?),
+        "url" => Kind::Url(req_str(f, "url")?),
+        "command" => Kind::Cmd {
+            ps: match req_str(f, "shell")?.as_str() {
+                "cmd" => false,
+                "powershell" => true,
+                s => return Err(format!("unknown shell {s:?} (cmd or powershell)")),
+            },
+            line: req_str(f, "command")?,
+        },
+        _ => match get(f, "milliseconds") {
+            Some(Json::Num(n)) => Kind::Wait(*n),
+            _ => return Err("\"milliseconds\" must be a non-negative integer".into()),
+        },
+    };
+    Ok(Step { off, kind })
+}
+
+fn write_step(o: &mut String, s: &Step) {
+    o.push_str("{ \"type\": ");
+    json::write_str(o, KINDS[s.kind.index()]);
+    match &s.kind {
+        Kind::App { path, args, dir } => {
+            kv(o, "path", path);
+            if !args.is_empty() {
+                kv(o, "arguments", args);
+            }
+            if !dir.is_empty() {
+                kv(o, "working_directory", dir);
+            }
+        }
+        Kind::Folder(p) | Kind::File(p) => kv(o, "path", p),
+        Kind::Url(u) => kv(o, "url", u),
+        Kind::Cmd { ps, line } => {
+            kv(o, "shell", if *ps { "powershell" } else { "cmd" });
+            kv(o, "command", line);
+        }
+        Kind::Wait(ms) => o.push_str(&format!(", \"milliseconds\": {ms}")),
+    }
+    if s.off {
+        o.push_str(", \"disabled\": true");
+    }
+    o.push_str(" }");
+}
+
+fn kv(o: &mut String, k: &str, v: &str) {
+    o.push_str(", \"");
+    o.push_str(k);
+    o.push_str("\": ");
+    json::write_str(o, v);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const VALID: &str = r#"{
-        "version": 1,
-        "profiles": [
-            {
-                "id": "{11111111-2222-3333-4444-555555555555}",
-                "name": "Dev",
-                "actions": [
-                    { "id": "a1", "type": "wait", "milliseconds": 100 },
-                    { "id": "a2", "type": "url", "url": "https://example.com", "disabled": true },
-                    { "id": "a3", "type": "application", "path": "C:\\Tools\\app.exe", "arguments": "-x 1" },
-                    { "id": "a4", "type": "command", "shell": "powershell", "command": "Get-Date" }
-                ]
-            }
-        ]
-    }"#;
+    const ID: &str = "{11111111-2222-3333-4444-555555555555}";
 
-    #[test]
-    fn parses_valid_config() {
-        let config = Config::parse(VALID).unwrap();
-        assert_eq!(config.version, 1);
-        assert_eq!(config.profiles.len(), 1);
-        assert_eq!(config.profiles[0].actions.len(), 4);
-        assert!(config.profiles[0].actions[1].disabled);
+    fn one(action: &str) -> Result<Config, String> {
+        Config::parse(&format!(
+            r#"{{"version":1,"profiles":[{{"id":"{ID}","name":"x","actions":[{action}]}}]}}"#
+        ))
     }
 
     #[test]
-    fn rejects_unknown_version() {
-        let err = Config::parse(r#"{"version": 99, "profiles": []}"#)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("unsupported config version"), "{err}");
+    fn loads_the_example_file() {
+        let c = Config::parse(include_str!("../config.example.json")).unwrap();
+        assert_eq!(c.profiles[0].steps.len(), 5);
+        assert!(c.profiles[0].steps[3].off);
+        assert_eq!(c.profiles[0].steps[2].kind, Kind::Wait(500));
     }
 
     #[test]
-    fn rejects_broken_json() {
-        assert!(Config::parse("{ not json").is_err());
-    }
-
-    #[test]
-    fn rejects_unknown_fields() {
-        let err = Config::parse(r#"{"version": 1, "profiles": [], "extra": 1}"#)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("unknown field"), "{err}");
-    }
-
-    #[test]
-    fn rejects_unknown_action_type() {
-        let err = Config::parse(
-            r#"{"version":1,"profiles":[{"id":"11111111-2222-3333-4444-555555555555","name":"x","actions":[{"id":"a","type":"reboot"}]}]}"#,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("unknown variant"), "{err}");
-    }
-
-    #[test]
-    fn rejects_unknown_action_field() {
-        let err = Config::parse(
-            r#"{"version":1,"profiles":[{"id":"11111111-2222-3333-4444-555555555555","name":"x","actions":[{"id":"a","type":"wait","milliseconds":1,"bogus":2}]}]}"#,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("unknown field"), "{err}");
-    }
-
-    #[test]
-    fn rejects_invalid_profile_guid() {
-        let err = Config::parse(
-            r#"{"version":1,"profiles":[{"id":"not-a-guid","name":"x","actions":[]}]}"#,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("not a valid GUID"), "{err}");
-    }
-
-    #[test]
-    fn rejects_duplicate_profile_ids_case_insensitive() {
-        let err = Config::parse(
-            r#"{"version":1,"profiles":[
-                {"id":"AAAAAAAA-2222-3333-4444-555555555555","name":"x","actions":[]},
-                {"id":"aaaaaaaa-2222-3333-4444-555555555555","name":"y","actions":[]}
-            ]}"#,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("duplicate profile id"), "{err}");
-    }
-
-    #[test]
-    fn rejects_duplicate_action_ids() {
-        let err = Config::parse(
-            r#"{"version":1,"profiles":[{"id":"11111111-2222-3333-4444-555555555555","name":"x","actions":[
-                {"id":"a","type":"wait","milliseconds":1},
-                {"id":"a","type":"wait","milliseconds":2}
-            ]}]}"#,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("duplicate action id"), "{err}");
-    }
-
-    #[test]
-    fn rejects_empty_application_path() {
-        let err = Config::parse(
-            r#"{"version":1,"profiles":[{"id":"11111111-2222-3333-4444-555555555555","name":"x","actions":[
-                {"id":"a","type":"application","path":""}
-            ]}]}"#,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("must not be empty"), "{err}");
-    }
-
-    #[test]
-    fn rejects_huge_wait() {
-        let err = Config::parse(
-            r#"{"version":1,"profiles":[{"id":"11111111-2222-3333-4444-555555555555","name":"x","actions":[
-                {"id":"a","type":"wait","milliseconds":99999999999}
-            ]}]}"#,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("exceeds the maximum"), "{err}");
-    }
-
-    #[test]
-    fn rejects_url_without_scheme() {
-        let err = Config::parse(
-            r#"{"version":1,"profiles":[{"id":"11111111-2222-3333-4444-555555555555","name":"x","actions":[
-                {"id":"a","type":"url","url":"example.com"}
-            ]}]}"#,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("no scheme"), "{err}");
-    }
-
-    /// `C:\dir` must not be mistaken for scheme `C`; such paths belong in a
-    /// file/folder action.
-    #[test]
-    fn rejects_windows_path_as_url() {
-        for path in ["C:\\work", "C:/work", "D:"] {
-            let json = format!(
-                r#"{{"version":1,"profiles":[{{"id":"11111111-2222-3333-4444-555555555555","name":"x","actions":[
-                    {{"id":"a","type":"url","url":"{}"}}
-                ]}}]}}"#,
-                path.replace('\\', "\\\\")
-            );
-            let err = Config::parse(&json).unwrap_err().to_string();
-            assert!(err.contains("no scheme"), "{path}: {err}");
-        }
-    }
-
-    #[test]
-    fn accepts_mailto_and_non_http_schemes() {
-        Config::parse(
-            r#"{"version":1,"profiles":[{"id":"11111111-2222-3333-4444-555555555555","name":"x","actions":[
-                {"id":"a","type":"url","url":"mailto:a@b.c"}
-            ]}]}"#,
-        )
+    fn loads_old_files_with_action_ids_and_bom() {
+        let c = Config::parse(&format!(
+            "\u{feff}{{\"version\":1,\"profiles\":[{{\"id\":\"{}\",\"name\":\"x\",\"actions\":[\
+             {{\"id\":\"a1\",\"type\":\"application\",\"path\":\"C:\\\\a.exe\",\"working_directory\":null}}]}}]}}",
+            ID.replace('{', "").replace('}', "")
+        ))
         .unwrap();
-    }
-
-    #[test]
-    fn rejects_interior_nul() {
-        let err = Config::parse(
-            "{\"version\":1,\"profiles\":[{\"id\":\"11111111-2222-3333-4444-555555555555\",\"name\":\"x\",\"actions\":[{\"id\":\"a\",\"type\":\"file\",\"path\":\"C:\\\\a\\u0000b.txt\"}]}]}",
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("NUL"), "{err}");
-    }
-
-    #[test]
-    fn guid_validation() {
-        assert!(is_valid_guid("11111111-2222-3333-4444-555555555555"));
-        assert!(is_valid_guid("{11111111-2222-3333-4444-555555555555}"));
-        assert!(is_valid_guid("abcdefab-0000-ffff-9999-000000000000"));
-        assert!(!is_valid_guid("{11111111-2222-3333-4444-555555555555"));
-        assert!(!is_valid_guid("11111111-2222-3333-4444-55555555555"));
-        assert!(!is_valid_guid("11111111-2222-3333-4444-55555555555g"));
-        assert!(!is_valid_guid("11111111222233334444555555555555"));
-        assert!(!is_valid_guid(""));
-    }
-
-    #[test]
-    fn save_roundtrips_and_refuses_invalid() {
-        let dir = std::env::temp_dir().join(format!("pl-test-{}", std::process::id()));
-        let path = dir.join("config.json");
-        let config = Config::parse(VALID).unwrap();
-
-        config.save(&path).unwrap();
-        // The saved file parses back to an equivalent config.
-        let reloaded = Config::load(&path).unwrap();
-        assert_eq!(reloaded.profiles.len(), config.profiles.len());
-        assert_eq!(reloaded.profiles[0].id, config.profiles[0].id);
         assert_eq!(
-            reloaded.profiles[0].actions.len(),
-            config.profiles[0].actions.len()
+            c.profiles[0].steps[0].kind,
+            Kind::App { path: "C:\\a.exe".into(), args: String::new(), dir: String::new() }
         );
+        assert!(c.find(ID).is_some());
+    }
 
-        // An invalid config must be refused before anything is written.
-        let mut bad = config.clone();
-        bad.profiles[0].id = "not-a-guid".to_string();
+    #[test]
+    fn roundtrips_every_kind() {
+        let c = Config {
+            profiles: vec![
+                Profile {
+                    id: ID.into(),
+                    name: "Dev \"q\" 日本".into(),
+                    steps: vec![
+                        Step { off: false, kind: Kind::App { path: "C:\\a b\\x.exe".into(), args: "-v \"1\"".into(), dir: "D:\\w".into() } },
+                        Step { off: true, kind: Kind::Folder("C:\\f".into()) },
+                        Step { off: false, kind: Kind::File("C:\\f\\n.txt".into()) },
+                        Step { off: false, kind: Kind::Url("https://example.com/?a=1&b=2".into()) },
+                        Step { off: false, kind: Kind::Cmd { ps: true, line: "Get-Date\n".into() } },
+                        Step { off: false, kind: Kind::Wait(250) },
+                    ],
+                },
+                Profile { id: "aaaaaaaa-2222-3333-4444-555555555555".into(), name: "Empty".into(), steps: vec![] },
+            ],
+        };
+        assert_eq!(Config::parse(&c.to_json()).unwrap(), c);
+        assert_eq!(Config::parse(&Config::default().to_json()).unwrap(), Config::default());
+    }
+
+    #[test]
+    fn rejects_bad_configs() {
+        for (bad, why) in [
+            (r#"{"version":2}"#.to_string(), "version"),
+            (r#"{"version":1,"extra":1}"#.to_string(), "unknown field"),
+            (r#"{"version":1,"profiles":[{"id":"nope","name":"x"}]}"#.to_string(), "GUID"),
+            (format!(r#"{{"version":1,"profiles":[{{"id":"{ID}","name":" "}}]}}"#), "empty name"),
+            (
+                format!(r#"{{"version":1,"profiles":[{{"id":"{ID}","name":"a"}},{{"id":"11111111-2222-3333-4444-555555555555","name":"b"}}]}}"#),
+                "duplicate profile",
+            ),
+        ] {
+            let e = Config::parse(&bad).unwrap_err();
+            assert!(e.contains(why), "{bad}: {e}");
+        }
+        for (action, why) in [
+            (r#"{"type":"reboot"}"#, "unknown action type"),
+            (r#"{"type":"wait","milliseconds":1,"bogus":2}"#, "unknown field"),
+            (r#"{"type":"wait","milliseconds":99999999999}"#, "longer than"),
+            (r#"{"type":"application","path":""}"#, "empty"),
+            (r#"{"type":"application","path":"C:\\a\"b.exe"}"#, "invalid program path"),
+            (r#"{"type":"application","path":"C:\\Tools\\"}"#, "invalid program path"),
+            (r#"{"type":"application","path":"a.exe","working_directory":"rel"}"#, "absolute"),
+            (r#"{"type":"url","url":"example.com"}"#, "scheme"),
+            (r#"{"type":"url","url":"C:\\work"}"#, "scheme"),
+            (r#"{"type":"command","shell":"bash","command":"ls"}"#, "unknown shell"),
+            (r#"{"type":"file","path":"a","path":"b"}"#, "duplicate field"),
+        ] {
+            let e = one(action).unwrap_err();
+            assert!(e.contains(why), "{action}: {e}");
+        }
+        one(r#"{"type":"url","url":"mailto:a@b.c"}"#).unwrap();
+        one(r#"{"type":"application","path":"a.exe","working_directory":"\\\\srv\\share"}"#).unwrap();
+    }
+
+    #[test]
+    fn guids() {
+        assert!(is_guid("11111111-2222-3333-4444-555555555555"));
+        assert!(is_guid("{abcdefab-0000-ffff-9999-000000000000}"));
+        assert!(!is_guid("{11111111-2222-3333-4444-555555555555"));
+        assert!(!is_guid("11111111-2222-3333-4444-55555555555g"));
+        assert!(!is_guid(""));
+    }
+
+    #[test]
+    fn shortcut_names() {
+        let p = |name: &str| Profile { id: ID.into(), name: name.into(), steps: vec![] };
+        assert_eq!(shortcut_file_name(&p("Dev Env")), "Dev Env-11111111.lnk");
+        assert_eq!(shortcut_file_name(&p("a/b:c*\t")), "a_b_c__-11111111.lnk");
+        assert_eq!(shortcut_file_name(&p("name. ")), "name-11111111.lnk");
+        assert_eq!(shortcut_file_name(&p("con.foo")), "_con.foo-11111111.lnk");
+        assert_eq!(shortcut_file_name(&p("LPT1")), "_LPT1-11111111.lnk");
+        assert_eq!(shortcut_file_name(&p("console")), "console-11111111.lnk");
+        assert_eq!(shortcut_file_name(&p("...")), "_-11111111.lnk");
+    }
+
+    #[test]
+    fn save_then_load() {
+        let dir = std::env::temp_dir().join(format!("stilllaunch-test-{}", std::process::id()));
+        let path = dir.join("config.json");
+        let c = Config::parse(include_str!("../config.example.json")).unwrap();
+        c.save(&path).unwrap();
+        assert_eq!(load(&path).unwrap(), c);
+        let mut bad = c.clone();
+        bad.profiles[0].id = "x".into();
         assert!(bad.save(&path).is_err());
-        // ...and the previous file is still intact.
-        assert_eq!(Config::load(&path).unwrap().profiles.len(), 1);
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// `{X}` and `X` name the same profile for `find_profile`, so the
-    /// duplicate check must catch them too — otherwise the second entry
-    /// would be silently unreachable.
-    #[test]
-    fn rejects_duplicate_profile_ids_braced_vs_bare() {
-        let err = Config::parse(
-            r#"{"version":1,"profiles":[
-                {"id":"{AAAAAAAA-2222-3333-4444-555555555555}","name":"x","actions":[]},
-                {"id":"aaaaaaaa-2222-3333-4444-555555555555","name":"y","actions":[]}
-            ]}"#,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("duplicate profile id"), "{err}");
-    }
-
-    #[test]
-    fn rejects_whitespace_only_profile_name() {
-        let err = Config::parse(
-            r#"{"version":1,"profiles":[{"id":"11111111-2222-3333-4444-555555555555","name":"   ","actions":[]}]}"#,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("empty name"), "{err}");
-    }
-
-    /// Same rule as `actions::build_command_line`: the path is wrapped in
-    /// quotes at launch, so an embedded quote could never work.
-    #[test]
-    fn rejects_quoted_application_path() {
-        let err = Config::parse(
-            r#"{"version":1,"profiles":[{"id":"11111111-2222-3333-4444-555555555555","name":"x","actions":[
-                {"id":"a","type":"application","path":"C:\\Tools\"bad\\app.exe"}
-            ]}]}"#,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("must not contain a quote"), "{err}");
-    }
-
-    /// `"C:\dir\" arg` would escape the closing quote added at launch.
-    #[test]
-    fn rejects_application_path_ending_with_separator() {
-        for path in ["C:\\Tools\\", "C:/Tools/"] {
-            let json = format!(
-                r#"{{"version":1,"profiles":[{{"id":"11111111-2222-3333-4444-555555555555","name":"x","actions":[
-                    {{"id":"a","type":"application","path":"{}"}}
-                ]}}]}}"#,
-                path.replace('\\', "\\\\")
-            );
-            let err = Config::parse(&json).unwrap_err().to_string();
-            assert!(
-                err.contains("must not end with a path separator"),
-                "{path}: {err}"
-            );
-        }
-    }
-
-    fn config_with_working_dir(dir: &str) -> String {
-        format!(
-            r#"{{"version":1,"profiles":[{{"id":"11111111-2222-3333-4444-555555555555","name":"x","actions":[
-                {{"id":"a","type":"application","path":"C:\\Tools\\app.exe","working_directory":"{}"}}
-            ]}}]}}"#,
-            dir.replace('\\', "\\\\")
-        )
-    }
-
-    /// A relative working directory resolves against the launcher's own
-    /// CWD at run time, so it is rejected at validation time.
-    #[test]
-    fn rejects_relative_working_directory() {
-        for dir in ["Tools", ".\\Tools", "sub\\dir", "C:Tools"] {
-            let err = Config::parse(&config_with_working_dir(dir))
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("must be an absolute path"), "{dir}: {err}");
-        }
-    }
-
-    #[test]
-    fn accepts_absolute_working_directory() {
-        for dir in ["C:\\Tools", "D:/Tools", "\\\\server\\share"] {
-            Config::parse(&config_with_working_dir(dir)).unwrap_or_else(|e| panic!("{dir}: {e}"));
-        }
-    }
-
-    /// Notepad's "UTF-8 with BOM" save prepends U+FEFF; accept it.
-    #[test]
-    fn load_accepts_utf8_bom() {
-        let dir = std::env::temp_dir().join(format!("pl-test-bom-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.json");
-        std::fs::write(&path, format!("\u{feff}{VALID}")).unwrap();
-
-        let config = Config::load(&path).unwrap();
-        assert_eq!(config.profiles.len(), 1);
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn load_rejects_oversized_file() {
-        let dir = std::env::temp_dir().join(format!("pl-test-big-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.json");
-        // A file just over the cap; its contents are never read.
-        let file = std::fs::File::create(&path).unwrap();
-        file.set_len(MAX_CONFIG_BYTES + 1).unwrap();
-        drop(file);
-
-        let err = Config::load(&path).unwrap_err();
-        assert!(matches!(err, ConfigError::TooLarge { .. }), "{err:?}");
-        assert!(err.to_string().contains("too large"), "{err}");
-
+        assert_eq!(load(&path).unwrap(), c);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
