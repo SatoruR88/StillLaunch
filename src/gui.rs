@@ -1,2000 +1,762 @@
-//! Native GUI (Phase 5-6): profile list, profile/action editing, test launch,
-//! shortcut creation, file/folder pickers, and the autostart toggle.
+//! Profile editor: one fixed-size window. Left: profile list. Right: the
+//! selected profile's name, its steps and a form for one step. Plain Win32
+//! controls on a light grey background, flat owner-drawn buttons, one
+//! accent colour for the primary actions (Run, Save).
 //!
-//! Everything is raw Win32 with the built-in control classes (LISTBOX, EDIT,
-//! BUTTON, COMBOBOX, STATIC). There is no manifest and no comctl32 v6, so the
-//! controls render in the classic style — an accepted trade-off to keep a
-//! single dependency-free executable.
-//!
-//! The GUI edits `%LOCALAPPDATA%\ProjectLauncher\config.json` directly. A
-//! running resident picks changes up on the next run request via the mtime
-//! check in `ResidentState::current_config`, so no reload IPC is needed.
-//! Both `ProjectLauncher.exe` (no args) and `--settings` open this window.
-//!
-//! Dialogs are modeless windows driven modally: the owner is disabled and a
-//! nested message loop runs until the dialog is destroyed. `lpCreateParams`
-//! passes a pointer to the caller's stack context, matching the resident
-//! window's GWLP_USERDATA pattern.
+//! State lives in a thread-local `RefCell` that is only ever borrowed
+//! briefly through `with`, never across a Win32 call that can re-enter the
+//! window procedure; `try_borrow_mut` keeps a mistake from panicking inside
+//! the window procedure.
 
-#[cfg(not(windows))]
-pub fn run() -> Result<(), GuiError> {
-    Err(GuiError::UnsupportedPlatform)
+use crate::config::{self, Config, Kind, Profile, Step};
+use crate::run;
+use crate::win::{self, from_wide, wide};
+use std::cell::RefCell;
+use std::ffi::c_void;
+use std::path::PathBuf;
+use std::ptr::{null, null_mut};
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::{
+    CreateFontIndirectW, CreateSolidBrush, DT_CENTER, DT_SINGLELINE, DT_VCENTER, DrawFocusRect,
+    DrawTextW, FillRect, FrameRect, HBRUSH, HDC, HGDIOBJ, SelectObject, SetBkColor, SetBkMode,
+    SetTextColor, UpdateWindow,
+};
+use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree};
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::UI::Controls::Dialogs::{
+    GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_NOCHANGEDIR, OPENFILENAMEW,
+};
+use windows_sys::Win32::UI::Controls::{
+    BST_CHECKED, DRAWITEMSTRUCT, EM_SETSEL, ODS_DISABLED, ODS_FOCUS, ODS_SELECTED,
+};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
+use windows_sys::Win32::UI::Shell::{
+    BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS, BROWSEINFOW, SHBrowseForFolderW, SHGetPathFromIDListW,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::*;
+
+// Palette (COLORREF = 0x00BBGGRR).
+const BG: u32 = 0x00F8_F7F7; // #F7F7F8 window
+const PANEL: u32 = 0x00FF_FFFF; // #FFFFFF fields, lists
+const TEXT: u32 = 0x002A_2522; // #22252A
+const SUB: u32 = 0x0063_5B57; // #575B63 status line
+const LINE: u32 = 0x00E7_E5E5; // #E5E5E7 borders, pressed
+const MUTED: u32 = 0x00AD_A8A6; // #A6A8AD disabled text
+const ACCENT: u32 = 0x00D6_6C33; // #336CD6 primary buttons
+const ACCENT_DOWN: u32 = 0x00B0_592A; // pressed primary
+
+const W: i32 = 720;
+const H: i32 = 472;
+
+const ID_OK: i32 = 1; // Enter (sent by IsDialogMessageW)
+const ID_PHEAD: i32 = 100;
+const ID_PROFILES: i32 = 101;
+const ID_NEW: i32 = 102;
+const ID_PDEL: i32 = 103;
+const ID_RUN: i32 = 104;
+const ID_SHORTCUT: i32 = 105;
+const ID_NAME: i32 = 110;
+const ID_SHEAD: i32 = 111;
+const ID_STEPS: i32 = 112;
+const ID_KIND: i32 = 113;
+const ID_SHELL: i32 = 114;
+const ID_OFF: i32 = 115;
+const ID_TLABEL: i32 = 116;
+const ID_TARGET: i32 = 117;
+const ID_BROWSE: i32 = 118;
+const ID_ARGS: i32 = 119;
+const ID_DIR: i32 = 120;
+const ID_ADD: i32 = 121;
+const ID_SET: i32 = 122;
+const ID_SDEL: i32 = 123;
+const ID_UP: i32 = 124;
+const ID_DOWN: i32 = 125;
+const ID_AUTO: i32 = 130;
+const ID_SAVE: i32 = 131;
+const ID_STATUS: i32 = 132;
+
+const CLICKED: u32 = 0; // BN_CLICKED
+const WM_DONE: u32 = WM_APP + 1;
+
+const BTN: u32 = BS_OWNERDRAW as u32 | WS_TABSTOP;
+const EDT: u32 = ES_AUTOHSCROLL as u32 | WS_BORDER | WS_TABSTOP;
+const LST: u32 = LBS_NOTIFY as u32 | LBS_NOINTEGRALHEIGHT as u32 | WS_VSCROLL | WS_BORDER | WS_TABSTOP;
+const CMB: u32 = CBS_DROPDOWNLIST as u32 | WS_VSCROLL | WS_TABSTOP;
+const CHK: u32 = BS_AUTOCHECKBOX as u32 | WS_TABSTOP;
+
+/// class, text, style, x, y, w, h, id — in tab order.
+type Spec = (&'static str, &'static str, u32, i32, i32, i32, i32, i32);
+const CONTROLS: &[Spec] = &[
+    ("STATIC", "", 0, 16, 16, 200, 20, ID_PHEAD),
+    ("LISTBOX", "", LST, 16, 40, 200, 320, ID_PROFILES),
+    ("BUTTON", "新規", BTN, 16, 368, 96, 28, ID_NEW),
+    ("BUTTON", "削除", BTN, 120, 368, 96, 28, ID_PDEL),
+    ("BUTTON", "実行", BTN, 16, 404, 96, 28, ID_RUN),
+    ("BUTTON", "ショートカット", BTN, 120, 404, 96, 28, ID_SHORTCUT),
+    ("STATIC", "名前", 0, 236, 16, 76, 20, 0),
+    ("EDIT", "", EDT, 316, 12, 388, 24, ID_NAME),
+    ("STATIC", "", 0, 236, 48, 300, 20, ID_SHEAD),
+    ("LISTBOX", "", LST | LBS_USETABSTOPS as u32, 236, 72, 468, 152, ID_STEPS),
+    ("STATIC", "種類", 0, 236, 236, 76, 20, 0),
+    ("COMBOBOX", "", CMB, 316, 232, 136, 200, ID_KIND),
+    ("COMBOBOX", "", CMB, 460, 232, 120, 120, ID_SHELL),
+    ("BUTTON", "無効", CHK, 596, 234, 108, 22, ID_OFF),
+    ("STATIC", "", 0, 236, 268, 76, 20, ID_TLABEL),
+    ("EDIT", "", EDT, 316, 264, 352, 24, ID_TARGET),
+    ("BUTTON", "…", BTN, 676, 264, 28, 24, ID_BROWSE),
+    ("STATIC", "引数", 0, 236, 300, 76, 20, 0),
+    ("EDIT", "", EDT, 316, 296, 388, 24, ID_ARGS),
+    ("STATIC", "作業フォルダ", 0, 236, 332, 76, 20, 0),
+    ("EDIT", "", EDT, 316, 328, 388, 24, ID_DIR),
+    ("BUTTON", "追加", BTN, 316, 368, 76, 28, ID_ADD),
+    ("BUTTON", "更新", BTN, 396, 368, 76, 28, ID_SET),
+    ("BUTTON", "削除", BTN, 476, 368, 76, 28, ID_SDEL),
+    ("BUTTON", "↑", BTN, 556, 368, 36, 28, ID_UP),
+    ("BUTTON", "↓", BTN, 596, 368, 36, 28, ID_DOWN),
+    ("BUTTON", "Windows 起動時に常駐", CHK, 236, 408, 240, 22, ID_AUTO),
+    ("BUTTON", "保存", BTN, 608, 404, 96, 28, ID_SAVE),
+    ("STATIC", "", 0, 16, 444, 688, 20, ID_STATUS),
+];
+
+/// Combo labels, in `config::KINDS` order.
+const KIND_LABELS: [&str; 6] = ["アプリ", "フォルダ", "ファイル", "URL", "コマンド", "待機"];
+const TARGET_LABELS: [&str; 6] = ["プログラム", "フォルダ", "ファイル", "URL", "コマンド", "ミリ秒"];
+
+struct App {
+    cfg: Config,
+    path: PathBuf,
+    /// mtime when loaded/saved, to notice edits made by someone else.
+    mtime: Option<SystemTime>,
+    dirty: bool,
+    cur: Option<usize>,
 }
 
-use crate::config::ConfigError;
-use std::fmt;
-
-#[derive(Debug)]
-pub enum GuiError {
-    /// A Win32 call failed; `code` is GetLastError().
-    Win32 {
-        api: &'static str,
-        code: u32,
-    },
-    Config(ConfigError),
-    /// The host OS does not provide the required Win32 API.
-    /// Only constructed by the non-Windows stub.
-    #[allow(dead_code)]
-    UnsupportedPlatform,
+/// GDI handles (as usize so the static is Sync). Freed at process exit.
+struct Theme {
+    font: usize,
+    bg: usize,
+    panel: usize,
+    line: usize,
+    accent: usize,
+    accent_down: usize,
 }
 
-impl fmt::Display for GuiError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            GuiError::Win32 { api, code } => write!(f, "{api} failed (GetLastError={code})"),
-            GuiError::Config(e) => write!(f, "{e}"),
-            GuiError::UnsupportedPlatform => write!(f, "the GUI requires Windows"),
+thread_local! {
+    static APP: RefCell<Option<App>> = const { RefCell::new(None) };
+}
+static THEME: OnceLock<Theme> = OnceLock::new();
+/// Summaries from finished run threads, picked up on WM_DONE.
+static DONE: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn with<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
+    APP.with(|cell| {
+        let mut guard = cell.try_borrow_mut().ok()?;
+        (*guard).as_mut().map(f)
+    })
+}
+
+pub fn run() -> Result<(), String> {
+    let path = config::path()?;
+    let cfg = if path.exists() { config::load(&path) } else { Ok(Config::default()) };
+    let cfg = cfg.inspect_err(|e| {
+        win::message(null_mut(), &format!("設定ファイルを読み込めません。\n{e}"), MB_OK | MB_ICONERROR);
+    })?;
+    let first = (!cfg.profiles.is_empty()).then_some(0);
+    let mtime = config::mtime(&path);
+    let shown_path = path.display().to_string();
+    APP.with(|a| *a.borrow_mut() = Some(App { cfg, path, mtime, dirty: false, cur: first }));
+
+    unsafe {
+        // STA for the folder picker and the shortcut COM objects.
+        CoInitializeEx(null(), COINIT_APARTMENTTHREADED as u32);
+        let font = message_font();
+        let theme = THEME.get_or_init(|| Theme {
+            font,
+            bg: CreateSolidBrush(BG) as usize,
+            panel: CreateSolidBrush(PANEL) as usize,
+            line: CreateSolidBrush(LINE) as usize,
+            accent: CreateSolidBrush(ACCENT) as usize,
+            accent_down: CreateSolidBrush(ACCENT_DOWN) as usize,
+        });
+
+        let instance = GetModuleHandleW(null());
+        let class = wide("StillLaunch.Editor");
+        let mut wc: WNDCLASSW = std::mem::zeroed();
+        wc.lpfnWndProc = Some(wnd_proc);
+        wc.hInstance = instance;
+        wc.lpszClassName = class.as_ptr();
+        wc.hCursor = LoadCursorW(null_mut(), IDC_ARROW);
+        wc.hIcon = LoadIconW(null_mut(), IDI_APPLICATION);
+        wc.hbrBackground = theme.bg as HBRUSH;
+        if RegisterClassW(&wc) == 0 {
+            return Err(win::last_error("RegisterClassW"));
         }
-    }
-}
-
-impl std::error::Error for GuiError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            GuiError::Config(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-#[cfg(windows)]
-mod imp {
-    use super::GuiError;
-    use crate::config::{self, Action, ActionKind, CommandShell, Config, ConfigError, Profile};
-    use crate::{autostart, ipc, profile, shortcut};
-    use std::ffi::c_void;
-    use std::iter::once;
-    use std::mem::{size_of, zeroed};
-    use std::path::PathBuf;
-    use std::ptr;
-    use std::time::SystemTime;
-    use windows_sys::Win32::Foundation::{
-        BOOL, GetLastError, HWND, LPARAM, LRESULT, MAX_PATH, RECT, WPARAM,
-    };
-    use windows_sys::Win32::Graphics::Gdi::{
-        COLOR_WINDOW, CreateFontIndirectW, DeleteObject, HBRUSH, HFONT, UpdateWindow,
-    };
-    use windows_sys::Win32::System::Com::{
-        COINIT_APARTMENTTHREADED, CoCreateGuid, CoInitializeEx, CoTaskMemFree, CoUninitialize,
-    };
-    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-    use windows_sys::Win32::UI::Controls::BST_CHECKED;
-    use windows_sys::Win32::UI::Controls::Dialogs::{
-        GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST,
-        OPENFILENAMEW,
-    };
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, VK_ESCAPE, VK_RETURN};
-    use windows_sys::Win32::UI::Shell::{
-        BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS, BROWSEINFOW, SHBrowseForFolderW,
-        SHGetPathFromIDListW,
-    };
-    use windows_sys::Win32::UI::WindowsAndMessaging::*;
-    use windows_sys::core::GUID;
-
-    const CLASS_MAIN: &str = "ProjectLauncher.MainWindow";
-    const CLASS_PROFILE_EDIT: &str = "ProjectLauncher.ProfileEdit";
-    const CLASS_ACTION_EDIT: &str = "ProjectLauncher.ActionEdit";
-
-    /// Posted to the main window when a background run finishes; lparam is
-    /// a boxed `(ok, String)` the receiver must reclaim, wparam is
-    /// POST_MAGIC.
-    const WM_LAUNCH_DONE: u32 = WM_APP + 1;
-    /// Same payload contract as WM_LAUNCH_DONE, posted to the profile
-    /// editor when its test launch finishes.
-    const WM_TEST_DONE: u32 = WM_APP + 2;
-    /// wparam tag on WM_LAUNCH_DONE / WM_TEST_DONE. Only the worker threads
-    /// below attach it, so the handlers can reject forged messages instead
-    /// of feeding a crafted lparam to Box::from_raw.
-    const POST_MAGIC: WPARAM = 0x504C_4452; // "PLDR"
-
-    // Main window controls.
-    const IDC_LIST: i32 = 100;
-    const IDC_RUN: i32 = 101;
-    const IDC_NEW: i32 = 102;
-    const IDC_EDIT: i32 = 103;
-    const IDC_DEL: i32 = 104;
-    const IDC_SHORTCUT: i32 = 105;
-    const IDC_STATUS: i32 = 106;
-    const IDC_AUTOSTART: i32 = 107;
-
-    // Profile editor controls.
-    const IDC_PE_NAME: i32 = 200;
-    const IDC_PE_ID: i32 = 201;
-    const IDC_PE_ACTIONS: i32 = 202;
-    const IDC_PE_ADD: i32 = 203;
-    const IDC_PE_EDIT: i32 = 204;
-    const IDC_PE_DEL: i32 = 205;
-    const IDC_PE_UP: i32 = 206;
-    const IDC_PE_DOWN: i32 = 207;
-    const IDC_PE_TEST: i32 = 208;
-
-    // Action editor controls.
-    const IDC_AE_ID: i32 = 300;
-    const IDC_AE_TYPE: i32 = 301;
-    const IDC_AE_DISABLED: i32 = 302;
-    const IDC_AE_L1: i32 = 303;
-    const IDC_AE_F1: i32 = 304;
-    const IDC_AE_L2: i32 = 305;
-    const IDC_AE_F2: i32 = 306;
-    const IDC_AE_L3: i32 = 307;
-    const IDC_AE_F3: i32 = 308;
-    const IDC_AE_LS: i32 = 309;
-    const IDC_AE_SHELL: i32 = 310;
-    const IDC_AE_BROWSE: i32 = 311;
-
-    /// Tray-menu item ids for the shortcut popup.
-    const ID_SC_DESKTOP: usize = 1;
-    const ID_SC_STARTMENU: usize = 2;
-    const ID_SC_BOTH: usize = 3;
-
-    /// The action types in combo order; index <-> ActionKind via
-    /// `kind_index`/`default_kind`.
-    const TYPE_NAMES: [&str; 6] = ["application", "folder", "file", "url", "command", "wait"];
-    const SHELL_NAMES: [&str; 2] = ["cmd", "powershell"];
-
-    // ---------- shared helpers ----------
-
-    fn wide(s: &str) -> Vec<u16> {
-        s.encode_utf16().chain(once(0)).collect()
-    }
-
-    fn win32(api: &'static str) -> GuiError {
-        // SAFETY: called immediately after a failed Win32 call.
-        GuiError::Win32 {
-            api,
-            code: unsafe { GetLastError() },
-        }
-    }
-
-    /// Parameters for [`control`]; built with [`ctl`] plus struct-update
-    /// syntax for `style`/`ex` when needed.
-    struct Ctl<'a> {
-        class: &'a str,
-        text: &'a str,
-        style: u32,
-        ex: u32,
-        x: i32,
-        y: i32,
-        w: i32,
-        h: i32,
-        id: i32,
-    }
-
-    fn ctl<'a>(class: &'a str, text: &'a str, x: i32, y: i32, w: i32, h: i32, id: i32) -> Ctl<'a> {
-        Ctl {
-            class,
-            text,
-            style: 0,
-            ex: 0,
-            x,
-            y,
+        let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+        let mut rc = RECT { left: 0, top: 0, right: W, bottom: H };
+        AdjustWindowRect(&mut rc, style, 0);
+        let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+        let title = wide(win::TITLE);
+        let hwnd = CreateWindowExW(
+            0,
+            class.as_ptr(),
+            title.as_ptr(),
+            style,
+            (GetSystemMetrics(SM_CXSCREEN) - w) / 2,
+            (GetSystemMetrics(SM_CYSCREEN) - h) / 2,
             w,
             h,
-            id,
+            null_mut(),
+            null_mut(),
+            instance,
+            null(),
+        );
+        if hwnd.is_null() {
+            return Err(win::last_error("CreateWindowExW"));
         }
-    }
+        build(hwnd, font);
+        set_check(hwnd, ID_AUTO, win::autostart_enabled());
+        refresh_profiles(hwnd);
+        show_profile(hwnd);
+        kind_changed(hwnd);
+        status(hwnd, &shown_path);
+        ShowWindow(hwnd, SW_SHOW);
+        UpdateWindow(hwnd);
 
-    /// Creates a child control and applies the dialog font to it.
-    unsafe fn control(parent: HWND, spec: &Ctl, font: HFONT) -> HWND {
-        let class = wide(spec.class);
-        let text = wide(spec.text);
-        // SAFETY: class is a built-in control class name; hInstance may be
-        // NULL because system classes do not look it up.
-        let hwnd = unsafe {
-            CreateWindowExW(
-                spec.ex,
-                class.as_ptr(),
-                text.as_ptr(),
-                WS_CHILD | WS_VISIBLE | spec.style,
-                spec.x,
-                spec.y,
-                spec.w,
-                spec.h,
-                parent,
-                spec.id as usize as _,
-                ptr::null_mut(),
-                ptr::null(),
-            )
-        };
-        if !hwnd.is_null() {
-            // SAFETY: hwnd is a live control; font is a valid HFONT.
-            unsafe { SendMessageW(hwnd, WM_SETFONT, font as WPARAM, 1) };
-        }
-        hwnd
-    }
-
-    /// The message-box font (Meiryo UI on Japanese systems) so the GUI does
-    /// not fall back to a bitmap font.
-    fn message_font() -> HFONT {
-        // SAFETY: ncm is sized before the call per SPI_GETNONCLIENTMETRICS
-        // contract; on failure we return a null HFONT and controls keep their
-        // default font.
-        unsafe {
-            let mut ncm: NONCLIENTMETRICSW = zeroed();
-            ncm.cbSize = size_of::<NONCLIENTMETRICSW>() as u32;
-            if SystemParametersInfoW(
-                SPI_GETNONCLIENTMETRICS,
-                ncm.cbSize,
-                &mut ncm as *mut _ as *mut c_void,
-                0,
-            ) == 0
-            {
-                return ptr::null_mut();
-            }
-            CreateFontIndirectW(&ncm.lfMessageFont)
-        }
-    }
-
-    fn set_text(hwnd: HWND, id: i32, text: &str) {
-        let w = wide(text);
-        // SAFETY: SetDlgItemTextW handles a missing control id by failing.
-        unsafe { SetDlgItemTextW(hwnd, id, w.as_ptr()) };
-    }
-
-    fn dlg_text(hwnd: HWND, id: i32) -> String {
-        // SAFETY: GetDlgItem may return NULL; GetWindowTextLengthW on NULL
-        // yields 0 and the empty buffer stays valid.
-        unsafe {
-            let c = GetDlgItem(hwnd, id);
-            if c.is_null() {
-                return String::new();
-            }
-            let len = GetWindowTextLengthW(c) as usize + 1;
-            let mut buf = vec![0u16; len];
-            let n = GetWindowTextW(c, buf.as_mut_ptr(), len as i32) as usize;
-            buf.truncate(n);
-            String::from_utf16_lossy(&buf)
-        }
-    }
-
-    fn set_item_visible(hwnd: HWND, id: i32, visible: bool) {
-        unsafe {
-            let c = GetDlgItem(hwnd, id);
-            if !c.is_null() {
-                ShowWindow(c, if visible { SW_SHOW } else { SW_HIDE });
-            }
-        }
-    }
-
-    fn set_item_enabled(hwnd: HWND, id: i32, enabled: bool) {
-        unsafe {
-            let c = GetDlgItem(hwnd, id);
-            if !c.is_null() {
-                EnableWindow(c, enabled as BOOL);
-            }
-        }
-    }
-
-    unsafe fn error_box(parent: HWND, message: &str) {
-        let text = wide(message);
-        let title = wide("Project Launcher");
-        // SAFETY: strings are NUL-terminated by `wide`.
-        unsafe { MessageBoxW(parent, text.as_ptr(), title.as_ptr(), MB_ICONERROR | MB_OK) };
-    }
-
-    unsafe fn info_box(parent: HWND, message: &str) {
-        let text = wide(message);
-        let title = wide("Project Launcher");
-        unsafe {
-            MessageBoxW(
-                parent,
-                text.as_ptr(),
-                title.as_ptr(),
-                MB_ICONINFORMATION | MB_OK,
-            )
-        };
-    }
-
-    /// Runs a nested message loop while `parent` is disabled, making `hwnd`
-    /// effectively modal. IsDialogMessage gets Tab navigation and button
-    /// activation; Enter/Escape fall back to OK/Cancel commands.
-    unsafe fn modal(parent: HWND, hwnd: HWND) {
-        unsafe {
-            EnableWindow(parent, 0);
-            ShowWindow(hwnd, SW_SHOW);
-            UpdateWindow(hwnd);
-            let mut msg: MSG = zeroed();
-            while IsWindow(hwnd) != 0 {
-                let r = GetMessageW(&mut msg, ptr::null_mut(), 0, 0);
-                if r < 0 {
-                    break;
-                }
-                if r == 0 {
-                    // WM_QUIT was pulled off this thread's queue: re-post it
-                    // so the outer message loop still sees the quit request
-                    // instead of silently swallowing it.
-                    PostQuitMessage(0);
-                    break;
-                }
-                if IsDialogMessageW(hwnd, &msg) != 0 {
-                    continue;
-                }
-                if msg.message == WM_KEYDOWN {
-                    match msg.wParam {
-                        k if k == VK_RETURN as usize => {
-                            SendMessageW(hwnd, WM_COMMAND, IDOK as usize, 0);
-                            continue;
-                        }
-                        k if k == VK_ESCAPE as usize => {
-                            SendMessageW(hwnd, WM_COMMAND, IDCANCEL as usize, 0);
-                            continue;
-                        }
-                        _ => {}
-                    }
-                }
+        let mut msg: MSG = std::mem::zeroed();
+        while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+            // Gives Tab / Shift+Tab / Space navigation between controls.
+            if IsDialogMessageW(hwnd, &msg) == 0 {
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
-            EnableWindow(parent, 1);
-            SetForegroundWindow(parent);
         }
     }
+    Ok(())
+}
 
-    /// Centers a not-yet-visible window on its owner, or on the primary
-    /// display when there is no owner.
-    unsafe fn centered_rect(w: i32, h: i32, owner: HWND) -> (i32, i32) {
-        unsafe {
-            let mut rc: RECT = zeroed();
-            if !owner.is_null() && GetWindowRect(owner, &mut rc) != 0 {
-                (
-                    rc.left + (rc.right - rc.left - w) / 2,
-                    rc.top + (rc.bottom - rc.top - h) / 2,
-                )
-            } else {
-                (
-                    (GetSystemMetrics(SM_CXSCREEN) - w) / 2,
-                    (GetSystemMetrics(SM_CYSCREEN) - h) / 2,
-                )
-            }
+unsafe fn message_font() -> usize {
+    unsafe {
+        let mut ncm: NONCLIENTMETRICSW = std::mem::zeroed();
+        ncm.cbSize = size_of::<NONCLIENTMETRICSW>() as u32;
+        let p = &mut ncm as *mut NONCLIENTMETRICSW as *mut c_void;
+        if SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, ncm.cbSize, p, 0) == 0 {
+            return 0; // WM_SETFONT(0) = system font
         }
-    }
-
-    /// Reads GWLP_USERDATA as a `*mut T`. Null before WM_NCCREATE stores it
-    /// and after WM_DESTROY clears it.
-    unsafe fn state_of<T>(hwnd: HWND) -> *mut T {
-        unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut T }
-    }
-
-    /// Loads the CREATESTRUCT context pointer written by every dialog's
-    /// WM_NCCREATE handler.
-    unsafe fn create_param<T>(lparam: LPARAM) -> *mut T {
-        unsafe { (*(lparam as *const CREATESTRUCTW)).lpCreateParams as *mut T }
-    }
-
-    fn command_id(wparam: WPARAM) -> i32 {
-        (wparam & 0xFFFF) as i32
-    }
-
-    fn command_code(wparam: WPARAM) -> u32 {
-        ((wparam >> 16) & 0xFFFF) as u32
-    }
-
-    /// Selected row in a listbox, or None.
-    fn list_sel(hwnd: HWND, id: i32) -> Option<usize> {
-        unsafe {
-            let lb = GetDlgItem(hwnd, id);
-            if lb.is_null() {
-                return None;
-            }
-            let i = SendMessageW(lb, LB_GETCURSEL, 0, 0);
-            if i < 0 { None } else { Some(i as usize) }
-        }
-    }
-
-    fn list_select(hwnd: HWND, id: i32, index: usize) {
-        unsafe {
-            let lb = GetDlgItem(hwnd, id);
-            if !lb.is_null() {
-                SendMessageW(lb, LB_SETCURSEL, index, 0);
-            }
-        }
-    }
-
-    fn list_reset(hwnd: HWND, id: i32, items: &[String]) {
-        unsafe {
-            let lb = GetDlgItem(hwnd, id);
-            if lb.is_null() {
-                return;
-            }
-            SendMessageW(lb, LB_RESETCONTENT, 0, 0);
-            for item in items {
-                let w = wide(item);
-                SendMessageW(lb, LB_ADDSTRING, 0, w.as_ptr() as LPARAM);
-            }
-        }
-    }
-
-    /// Generates `{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}` via CoCreateGuid.
-    fn new_guid() -> Result<String, GuiError> {
-        unsafe {
-            let mut g: GUID = zeroed();
-            if CoCreateGuid(&mut g) < 0 {
-                return Err(win32("CoCreateGuid"));
-            }
-            Ok(format!(
-                "{{{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
-                g.data1,
-                g.data2,
-                g.data3,
-                g.data4[0],
-                g.data4[1],
-                g.data4[2],
-                g.data4[3],
-                g.data4[4],
-                g.data4[5],
-                g.data4[6],
-                g.data4[7],
-            ))
-        }
-    }
-
-    /// GetOpenFileNameW wrapper. `filter` uses the Win32 NUL-separated
-    /// "label\0pattern\0" form; `wide` supplies the final terminator.
-    /// Returns None on cancel (also on dialog errors — same UX).
-    unsafe fn browse_file(parent: HWND, filter: &str) -> Option<String> {
-        let mut buf = vec![0u16; MAX_PATH as usize];
-        let filter_w = wide(filter);
-        // SAFETY: all pointers are valid for the call; OFN_NOCHANGEDIR keeps
-        // the dialog from mutating our process CWD.
-        unsafe {
-            let mut ofn: OPENFILENAMEW = zeroed();
-            ofn.lStructSize = size_of::<OPENFILENAMEW>() as u32;
-            ofn.hwndOwner = parent;
-            ofn.lpstrFilter = filter_w.as_ptr();
-            ofn.lpstrFile = buf.as_mut_ptr();
-            ofn.nMaxFile = buf.len() as u32;
-            ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
-            if GetOpenFileNameW(&mut ofn) == 0 {
-                return None;
-            }
-        }
-        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-        Some(String::from_utf16_lossy(&buf[..len]))
-    }
-
-    /// SHBrowseForFolderW wrapper for folder-type paths. The new-dialog-style
-    /// flag requires a COM apartment, so one is initialized and balanced per
-    /// call (S_FALSE on an existing apartment still needs CoUninitialize).
-    unsafe fn browse_folder(parent: HWND, title: &str) -> Option<String> {
-        unsafe {
-            if CoInitializeEx(ptr::null(), COINIT_APARTMENTTHREADED as u32) < 0 {
-                return None;
-            }
-            let title_w = wide(title);
-            let mut display = vec![0u16; MAX_PATH as usize];
-            let mut bi: BROWSEINFOW = zeroed();
-            bi.hwndOwner = parent;
-            bi.pszDisplayName = display.as_mut_ptr();
-            bi.lpszTitle = title_w.as_ptr();
-            bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
-            let pidl = SHBrowseForFolderW(&bi);
-            let path = if pidl.is_null() {
-                None
-            } else {
-                let mut buf = vec![0u16; MAX_PATH as usize];
-                let ok = SHGetPathFromIDListW(pidl, buf.as_mut_ptr());
-                CoTaskMemFree(pidl as *const c_void);
-                if ok == 0 {
-                    None
-                } else {
-                    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-                    Some(String::from_utf16_lossy(&buf[..len]))
-                }
-            };
-            CoUninitialize();
-            path
-        }
-    }
-
-    /// Short one-line summary shown in the action listbox.
-    fn action_line(a: &Action) -> String {
-        let detail = match &a.kind {
-            ActionKind::Application { path, .. } => format!("application: {path}"),
-            ActionKind::Folder { path } => format!("folder: {path}"),
-            ActionKind::File { path } => format!("file: {path}"),
-            ActionKind::Url { url } => format!("url: {url}"),
-            ActionKind::Command { shell, command } => {
-                let shell = match shell {
-                    CommandShell::Cmd => "cmd",
-                    CommandShell::PowerShell => "powershell",
-                };
-                let cmd: String = command.chars().take(40).collect();
-                format!("command({shell}): {cmd}")
-            }
-            ActionKind::Wait { milliseconds } => format!("wait: {milliseconds}ms"),
-        };
-        let mut line = format!("{}  [{}]", a.id, detail);
-        if a.disabled {
-            line.push_str("  (無効)");
-        }
-        line
-    }
-
-    /// Runs `profile` on a worker and posts the summary to `hwnd` as
-    /// `done_msg` (lparam = boxed `(is_success, String)`, wparam =
-    /// POST_MAGIC). Fires exactly once.
-    fn spawn_test_launch(hwnd: HWND, profile: Profile, done_msg: u32) {
-        // HWND is a raw pointer (not Send); pass it as usize and cast back.
-        let hwnd = hwnd as usize;
-        std::thread::spawn(move || {
-            let hwnd = hwnd as HWND;
-            let result = profile::execute_profile(&profile, &mut |a| {
-                crate::actions::execute(a).map_err(|e| e.to_string())
-            });
-            let mut text = format!(
-                "プロファイル '{}' のテスト実行が完了しました。\r\n",
-                profile.name
-            );
-            for o in &result.outcomes {
-                match &o.status {
-                    profile::ActionStatus::Succeeded => {
-                        text.push_str(&format!("  [ok]     {}\r\n", o.action_id))
-                    }
-                    profile::ActionStatus::Failed(e) => {
-                        text.push_str(&format!("  [FAILED] {}: {e}\r\n", o.action_id))
-                    }
-                }
-            }
-            if result.skipped_disabled > 0 {
-                text.push_str(&format!(
-                    "  ({} 件の無効アクションをスキップ)\r\n",
-                    result.skipped_disabled
-                ));
-            }
-            text.push_str(&format!(
-                "{} 件中 {} 件失敗",
-                result.outcomes.len(),
-                result.failure_count()
-            ));
-            let boxed = Box::into_raw(Box::new((result.is_success(), text)));
-            // SAFETY: posting to a window handle; wparam tags the message
-            // as ours so the receiver can reject forged lparams. If the
-            // window is already gone the call fails and we reclaim the box
-            // instead of leaking it.
-            unsafe {
-                if PostMessageW(hwnd, done_msg, POST_MAGIC, boxed as LPARAM) == 0 {
-                    drop(Box::from_raw(boxed));
-                }
-            }
-        });
-    }
-
-    /// The CLI run path shared by the GUI: forward to the resident when one
-    /// is running, otherwise execute directly on a worker. `ok` in the
-    /// posted payload picks the icon of the completion box — failures and
-    /// IPC errors get the error icon, successful/forwarded runs the info
-    /// one.
-    fn spawn_run_profile(hwnd: HWND, id: String) {
-        let hwnd = hwnd as usize;
-        std::thread::spawn(move || {
-            let hwnd = hwnd as HWND;
-            let (ok, text) = match ipc::forward_run_profile(&id) {
-                Ok(ipc::ForwardOutcome::Delivered) => (
-                    true,
-                    format!("プロファイル {id} の実行を Resident に転送しました。"),
-                ),
-                Ok(ipc::ForwardOutcome::Rejected) => (
-                    false,
-                    format!("Resident がプロファイル {id} の要求を拒否しました。"),
-                ),
-                Ok(ipc::ForwardOutcome::NoResident) => match Config::load_default() {
-                    Err(e) => (false, format!("config の読み込みに失敗: {e}")),
-                    Ok(config) => match profile::find_profile(&config, &id) {
-                        None => (false, format!("プロファイル {id} が config にありません。")),
-                        Some(p) => {
-                            let result = profile::execute_profile(p, &mut |a| {
-                                crate::actions::execute(a).map_err(|e| e.to_string())
-                            });
-                            (
-                                result.is_success(),
-                                format!(
-                                    "プロファイル '{}' を直接実行しました: {} 件中 {} 件失敗。",
-                                    p.name,
-                                    result.outcomes.len(),
-                                    result.failure_count()
-                                ),
-                            )
-                        }
-                    },
-                },
-                Err(e) => (false, format!("Resident への転送に失敗: {e}")),
-            };
-            let boxed = Box::into_raw(Box::new((ok, text)));
-            // SAFETY: same PostMessageW contract as spawn_test_launch.
-            unsafe {
-                if PostMessageW(hwnd, WM_LAUNCH_DONE, POST_MAGIC, boxed as LPARAM) == 0 {
-                    drop(Box::from_raw(boxed));
-                }
-            }
-        });
-    }
-
-    // ---------- main window ----------
-
-    struct MainState {
-        config: Config,
-        config_path: PathBuf,
-        /// Mtime of the config file when it was loaded (None when it did
-        /// not exist). save_config compares it against the on-disk mtime
-        /// before overwriting, so an external edit made while this window
-        /// is open is not silently discarded.
-        config_mtime: Option<SystemTime>,
-        /// Set while a run worker is in flight so the 実行 button and list
-        /// double-clicks do not spawn a duplicate run; WM_LAUNCH_DONE
-        /// clears it (same role as ProfileEdit::testing).
-        running: bool,
-        font: HFONT,
-    }
-
-    fn fill_profiles(hwnd: HWND, config: &Config, keep_sel: Option<usize>) {
-        let items: Vec<String> = config
-            .profiles
-            .iter()
-            .map(|p| format!("{}  ({} actions)", p.name, p.actions.len()))
-            .collect();
-        list_reset(hwnd, IDC_LIST, &items);
-        if let Some(i) = keep_sel
-            && i < items.len()
-        {
-            list_select(hwnd, IDC_LIST, i);
-        }
-    }
-
-    /// Writes `candidate` to the config file. When the file's mtime differs
-    /// from what this window loaded (None when it did not exist — e.g. the
-    /// new-config path, or the file having been deleted meanwhile), an
-    /// external edit happened while the GUI was open and an unconditional
-    /// write would silently discard it, so the user is asked to confirm the
-    /// overwrite first. On success the recorded mtime is refreshed. On
-    /// failure (or a declined overwrite) false is returned and the error is
-    /// shown; callers then keep `state.config` (and the UI) identical to
-    /// the on-disk file instead of diverging.
-    ///
-    /// `state` is a raw pointer, not a &mut: the MessageBoxW below runs a
-    /// nested loop where a posted WM_LAUNCH_DONE can write `running`
-    /// through its own pointer, so borrows last single statements only.
-    unsafe fn save_config(hwnd: HWND, state: *mut MainState, candidate: &Config) -> bool {
-        let path = unsafe { &*state }.config_path.clone();
-        let known = unsafe { &*state }.config_mtime;
-        let disk = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-        if disk != known {
-            let text = wide("設定ファイルが外部で変更されています。上書きしますか?");
-            let title = wide("Project Launcher");
-            // SAFETY: static strings, NUL-terminated by `wide`.
-            let yes = unsafe {
-                MessageBoxW(
-                    hwnd,
-                    text.as_ptr(),
-                    title.as_ptr(),
-                    MB_ICONWARNING | MB_YESNO,
-                )
-            };
-            if yes != IDYES {
-                return false;
-            }
-        }
-        match candidate.save(&path) {
-            Ok(()) => {
-                // Record the fresh mtime so the next save compares against
-                // the file we just wrote, not the previously loaded one.
-                unsafe {
-                    (*state).config_mtime =
-                        std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-                }
-                true
-            }
-            Err(e) => {
-                unsafe { error_box(hwnd, &format!("config の保存に失敗しました: {e}")) };
-                false
-            }
-        }
-    }
-
-    /// Starts the selected profile on a worker. The `running` flag blocks a
-    /// second launch while one is already in flight; it is cleared when the
-    /// worker's WM_LAUNCH_DONE arrives.
-    fn launch_selected(hwnd: HWND, state: *mut MainState) {
-        if unsafe { (*state).running } {
-            // SAFETY: hwnd is a live window owned by this thread.
-            unsafe { info_box(hwnd, "実行中です。") };
-            return;
-        }
-        let Some(i) = list_sel(hwnd, IDC_LIST) else {
-            return;
-        };
-        let pid = unsafe { &*state }.config.profiles[i].id.clone();
-        unsafe { (*state).running = true };
-        spawn_run_profile(hwnd, pid);
-    }
-
-    unsafe fn main_command(hwnd: HWND, id: i32, code: u32) {
-        let state = unsafe { state_of::<MainState>(hwnd) };
-        if state.is_null() {
-            return;
-        }
-        // `state` stays a raw pointer here: profile_editor, save_config,
-        // shortcut_menu and MessageBoxW all run a nested message loop, and
-        // a posted WM_LAUNCH_DONE dispatched there writes `running` through
-        // its own pointer. A &mut held across such calls would alias that
-        // write, so every branch re-borrows for single statements only.
-        match id {
-            IDC_LIST if code == LBN_DBLCLK => launch_selected(hwnd, state),
-            IDC_RUN => launch_selected(hwnd, state),
-            IDC_NEW => match new_guid() {
-                Ok(guid) => {
-                    let p = Profile {
-                        id: guid,
-                        name: "新しいプロファイル".to_string(),
-                        actions: Vec::new(),
-                    };
-                    if let Some(p) = profile_editor(hwnd, p) {
-                        // The modal loop above may have delivered posted
-                        // messages; re-read the state pointer afterwards.
-                        let state = unsafe { state_of::<MainState>(hwnd) };
-                        if state.is_null() {
-                            return;
-                        }
-                        let mut candidate = unsafe { &*state }.config.clone();
-                        candidate.profiles.push(p);
-                        if unsafe { save_config(hwnd, state, &candidate) } {
-                            let state = unsafe { &mut *state };
-                            state.config = candidate;
-                            let last = state.config.profiles.len() - 1;
-                            fill_profiles(hwnd, &state.config, None);
-                            list_select(hwnd, IDC_LIST, last);
-                        }
-                    }
-                }
-                Err(e) => unsafe { error_box(hwnd, &e.to_string()) },
-            },
-            IDC_EDIT => {
-                if let Some(i) = list_sel(hwnd, IDC_LIST) {
-                    let p = unsafe { &*state }.config.profiles[i].clone();
-                    if let Some(edited) = profile_editor(hwnd, p) {
-                        let state = unsafe { state_of::<MainState>(hwnd) };
-                        if state.is_null() {
-                            return;
-                        }
-                        let mut candidate = unsafe { &*state }.config.clone();
-                        candidate.profiles[i] = edited;
-                        if unsafe { save_config(hwnd, state, &candidate) } {
-                            let state = unsafe { &mut *state };
-                            state.config = candidate;
-                            fill_profiles(hwnd, &state.config, Some(i));
-                        }
-                    }
-                }
-            }
-            IDC_DEL => {
-                if let Some(i) = list_sel(hwnd, IDC_LIST) {
-                    let name = unsafe { &*state }.config.profiles[i].name.clone();
-                    let text = wide(&format!("プロファイル '{name}' を削除しますか?"));
-                    let title = wide("Project Launcher");
-                    let yes = unsafe {
-                        MessageBoxW(
-                            hwnd,
-                            text.as_ptr(),
-                            title.as_ptr(),
-                            MB_ICONWARNING | MB_YESNO,
-                        )
-                    };
-                    if yes == IDYES {
-                        let state = unsafe { state_of::<MainState>(hwnd) };
-                        if state.is_null() {
-                            return;
-                        }
-                        let mut candidate = unsafe { &*state }.config.clone();
-                        candidate.profiles.remove(i);
-                        if unsafe { save_config(hwnd, state, &candidate) } {
-                            let state = unsafe { &mut *state };
-                            state.config = candidate;
-                            fill_profiles(hwnd, &state.config, None);
-                        }
-                    }
-                }
-            }
-            IDC_SHORTCUT => {
-                if let Some(i) = list_sel(hwnd, IDC_LIST) {
-                    let profile = unsafe { &*state }.config.profiles[i].clone();
-                    unsafe { shortcut_menu(hwnd, &profile) };
-                }
-            }
-            IDC_AUTOSTART => {
-                let check =
-                    unsafe { SendMessageW(GetDlgItem(hwnd, IDC_AUTOSTART), BM_GETCHECK, 0, 0) }
-                        == BST_CHECKED as isize;
-                if let Err(e) = autostart::set(check) {
-                    unsafe {
-                        error_box(hwnd, &format!("自動開始の設定に失敗しました: {e}"));
-                        // Revert the checkbox to the actual state.
-                        SendMessageW(
-                            GetDlgItem(hwnd, IDC_AUTOSTART),
-                            BM_SETCHECK,
-                            if check { 0 } else { BST_CHECKED as usize },
-                            0,
-                        );
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Popup under the shortcut button: Desktop / Start Menu / both.
-    unsafe fn shortcut_menu(hwnd: HWND, profile: &Profile) {
-        unsafe {
-            let btn = GetDlgItem(hwnd, IDC_SHORTCUT);
-            let menu = CreatePopupMenu();
-            if menu.is_null() {
-                return;
-            }
-            for (id, label) in [
-                (ID_SC_DESKTOP, "デスクトップ"),
-                (ID_SC_STARTMENU, "スタートメニュー"),
-                (ID_SC_BOTH, "両方"),
-            ] {
-                let w = wide(label);
-                AppendMenuW(menu, MF_STRING, id, w.as_ptr());
-            }
-            let mut rc: RECT = zeroed();
-            GetWindowRect(btn, &mut rc);
-            SetForegroundWindow(hwnd);
-            let cmd = TrackPopupMenu(
-                menu,
-                TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN,
-                rc.left,
-                rc.bottom,
-                0,
-                hwnd,
-                ptr::null(),
-            );
-            PostMessageW(hwnd, WM_NULL, 0, 0);
-            DestroyMenu(menu);
-            let locations: &[shortcut::ShortcutLocation] = match cmd as usize {
-                ID_SC_DESKTOP => &[shortcut::ShortcutLocation::Desktop],
-                ID_SC_STARTMENU => &[shortcut::ShortcutLocation::StartMenu],
-                ID_SC_BOTH => &[
-                    shortcut::ShortcutLocation::Desktop,
-                    shortcut::ShortcutLocation::StartMenu,
-                ],
-                _ => return,
-            };
-            let mut text = String::new();
-            let mut failed = false;
-            for &loc in locations {
-                match shortcut::create(&profile.name, &profile.id, loc) {
-                    Ok(path) => text.push_str(&format!("作成: {}\r\n", path.display())),
-                    Err(e) => {
-                        failed = true;
-                        text.push_str(&format!("失敗: {e}\r\n"));
-                    }
-                }
-            }
-            if failed {
-                error_box(hwnd, &text);
-            } else {
-                info_box(hwnd, &text);
-            }
-        }
-    }
-
-    unsafe extern "system" fn main_wnd_proc(
-        hwnd: HWND,
-        msg: u32,
-        wparam: WPARAM,
-        lparam: LPARAM,
-    ) -> LRESULT {
-        unsafe {
-            match msg {
-                WM_NCCREATE => {
-                    SetWindowLongPtrW(
-                        hwnd,
-                        GWLP_USERDATA,
-                        create_param::<MainState>(lparam) as isize,
-                    );
-                    DefWindowProcW(hwnd, msg, wparam, lparam)
-                }
-                WM_CREATE => {
-                    let state = state_of::<MainState>(hwnd);
-                    let font = if state.is_null() {
-                        ptr::null_mut()
-                    } else {
-                        (*state).font
-                    };
-                    control(
-                        hwnd,
-                        &Ctl {
-                            style: LBS_NOTIFY as u32 | WS_VSCROLL | WS_BORDER,
-                            ex: WS_EX_CLIENTEDGE,
-                            ..ctl("LISTBOX", "", 12, 12, 536, 300, IDC_LIST)
-                        },
-                        font,
-                    );
-                    let y = 322;
-                    control(hwnd, &ctl("BUTTON", "実行", 12, y, 120, 30, IDC_RUN), font);
-                    control(hwnd, &ctl("BUTTON", "新規", 142, y, 90, 30, IDC_NEW), font);
-                    control(hwnd, &ctl("BUTTON", "編集", 242, y, 90, 30, IDC_EDIT), font);
-                    control(hwnd, &ctl("BUTTON", "削除", 342, y, 90, 30, IDC_DEL), font);
-                    control(
-                        hwnd,
-                        &ctl("BUTTON", "ショートカット", 442, y, 106, 30, IDC_SHORTCUT),
-                        font,
-                    );
-                    let autostart = control(
-                        hwnd,
-                        &Ctl {
-                            style: BS_AUTOCHECKBOX as u32,
-                            ..ctl(
-                                "BUTTON",
-                                "Windows 起動時に常駐する",
-                                12,
-                                360,
-                                260,
-                                22,
-                                IDC_AUTOSTART,
-                            )
-                        },
-                        font,
-                    );
-                    if matches!(autostart::is_enabled(), Ok(true)) {
-                        SendMessageW(autostart, BM_SETCHECK, BST_CHECKED as usize, 0);
-                    }
-                    if !state.is_null() {
-                        let path = (*state).config_path.display().to_string();
-                        control(
-                            hwnd,
-                            &ctl("STATIC", &path, 12, 392, 536, 20, IDC_STATUS),
-                            font,
-                        );
-                        fill_profiles(hwnd, &(*state).config, None);
-                    }
-                    0
-                }
-                WM_COMMAND => {
-                    main_command(hwnd, command_id(wparam), command_code(wparam));
-                    0
-                }
-                WM_LAUNCH_DONE => {
-                    // Ignore forged completions: only our workers know
-                    // POST_MAGIC and always pass a non-null box, so anything
-                    // else must not reach Box::from_raw.
-                    if wparam == POST_MAGIC && lparam != 0 {
-                        let state = state_of::<MainState>(hwnd);
-                        if !state.is_null() {
-                            (*state).running = false;
-                        }
-                        let (ok, text) = *Box::from_raw(lparam as *mut (bool, String));
-                        if ok {
-                            info_box(hwnd, &text);
-                        } else {
-                            error_box(hwnd, &text);
-                        }
-                    }
-                    0
-                }
-                WM_CLOSE => {
-                    DestroyWindow(hwnd);
-                    0
-                }
-                WM_DESTROY => {
-                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-                    PostQuitMessage(0);
-                    0
-                }
-                _ => DefWindowProcW(hwnd, msg, wparam, lparam),
-            }
-        }
-    }
-
-    // ---------- profile editor ----------
-
-    struct ProfileEdit {
-        working: Profile,
-        accepted: bool,
-        /// Set while a test launch worker is in flight so a second click
-        /// does not spawn a duplicate run.
-        testing: bool,
-    }
-
-    fn fill_actions(hwnd: HWND, actions: &[Action], keep_sel: Option<usize>) {
-        let items: Vec<String> = actions.iter().map(action_line).collect();
-        list_reset(hwnd, IDC_PE_ACTIONS, &items);
-        if let Some(i) = keep_sel
-            && i < items.len()
-        {
-            list_select(hwnd, IDC_PE_ACTIONS, i);
-        }
-    }
-
-    /// The next free `action-N` id inside the working profile.
-    fn fresh_action_id(actions: &[Action]) -> String {
-        let mut n = 1;
-        while actions.iter().any(|a| a.id == format!("action{n}")) {
-            n += 1;
-        }
-        format!("action{n}")
-    }
-
-    /// Opens the profile editor modally. Returns the edited profile on OK.
-    fn profile_editor(parent: HWND, profile: Profile) -> Option<Profile> {
-        let mut edit = ProfileEdit {
-            working: profile,
-            accepted: false,
-            testing: false,
-        };
-        // SAFETY: `edit` outlives the modal loop; the window stores its
-        // pointer in GWLP_USERDATA and clears it on WM_DESTROY.
-        let hwnd = unsafe {
-            let (x, y) = centered_rect(640, 470, parent);
-            CreateWindowExW(
-                WS_EX_DLGMODALFRAME,
-                wide(CLASS_PROFILE_EDIT).as_ptr(),
-                wide("プロファイル編集").as_ptr(),
-                WS_POPUP | WS_CAPTION | WS_SYSMENU,
-                x,
-                y,
-                640,
-                470,
-                parent,
-                ptr::null_mut(),
-                GetModuleHandleW(ptr::null()),
-                &mut edit as *mut ProfileEdit as *const c_void,
-            )
-        };
-        if hwnd.is_null() {
-            return None;
-        }
-        unsafe { modal(parent, hwnd) };
-        edit.accepted.then_some(edit.working)
-    }
-
-    unsafe fn pe_on_command(hwnd: HWND, id: i32, code: u32) {
-        let state = unsafe { state_of::<ProfileEdit>(hwnd) };
-        if state.is_null() {
-            return;
-        }
-        // `state` stays a raw pointer here: action_editor (modal),
-        // error_box and info_box all run a nested message loop where a
-        // posted WM_TEST_DONE writes `testing` through its own pointer. A
-        // &mut held across such calls would alias that write, so borrows
-        // last single statements only and GWLP_USERDATA is read again after
-        // each modal call.
-        match id {
-            IDC_PE_ACTIONS if code == LBN_DBLCLK => {
-                if let Some(i) = list_sel(hwnd, IDC_PE_ACTIONS) {
-                    edit_action(hwnd, i);
-                }
-            }
-            IDC_PE_ADD => {
-                let (id, ids) = {
-                    let working = unsafe { &(*state).working };
-                    (
-                        fresh_action_id(&working.actions),
-                        working
-                            .actions
-                            .iter()
-                            .map(|a| a.id.clone())
-                            .collect::<Vec<String>>(),
-                    )
-                };
-                let mut action = Action {
-                    id,
-                    disabled: false,
-                    kind: ActionKind::Application {
-                        path: String::new(),
-                        arguments: String::new(),
-                        working_directory: None,
-                    },
-                };
-                if action_editor(hwnd, &mut action, &ids, usize::MAX) {
-                    // The modal loop may have delivered posted messages;
-                    // re-read the state pointer afterwards.
-                    let state = unsafe { state_of::<ProfileEdit>(hwnd) };
-                    if !state.is_null() {
-                        let state = unsafe { &mut *state };
-                        state.working.actions.push(action);
-                        fill_actions(hwnd, &state.working.actions, None);
-                        list_select(hwnd, IDC_PE_ACTIONS, state.working.actions.len() - 1);
-                    }
-                }
-            }
-            IDC_PE_EDIT => {
-                if let Some(i) = list_sel(hwnd, IDC_PE_ACTIONS) {
-                    edit_action(hwnd, i);
-                }
-            }
-            IDC_PE_DEL => {
-                if let Some(i) = list_sel(hwnd, IDC_PE_ACTIONS) {
-                    let state = unsafe { &mut *state };
-                    state.working.actions.remove(i);
-                    fill_actions(hwnd, &state.working.actions, None);
-                }
-            }
-            IDC_PE_UP | IDC_PE_DOWN => {
-                if let Some(i) = list_sel(hwnd, IDC_PE_ACTIONS) {
-                    let state = unsafe { &mut *state };
-                    let j = if id == IDC_PE_UP {
-                        i.checked_sub(1)
-                    } else {
-                        (i + 1 < state.working.actions.len()).then_some(i + 1)
-                    };
-                    if let Some(j) = j {
-                        state.working.actions.swap(i, j);
-                        fill_actions(hwnd, &state.working.actions, Some(j));
-                    }
-                }
-            }
-            IDC_PE_TEST => {
-                if unsafe { !(*state).testing } {
-                    let profile = unsafe { &*state }.working.clone();
-                    unsafe { (*state).testing = true };
-                    spawn_test_launch(hwnd, profile, WM_TEST_DONE);
-                }
-            }
-            IDOK => {
-                // Write the name and validate first so the &mut ends before
-                // the message boxes below spin their own loop.
-                let (name_empty, invalid) = {
-                    let state = unsafe { &mut *state };
-                    state.working.name = dlg_text(hwnd, IDC_PE_NAME);
-                    // Reuse full validation by wrapping in a one-profile
-                    // config; this catches duplicate action ids and
-                    // per-action rules.
-                    let check = Config {
-                        version: config::CURRENT_CONFIG_VERSION,
-                        profiles: vec![state.working.clone()],
-                    };
-                    (state.working.name.is_empty(), check.validate().err())
-                };
-                if name_empty {
-                    unsafe { error_box(hwnd, "名前を入力してください。") };
-                    return;
-                }
-                if let Some(m) = invalid {
-                    unsafe { error_box(hwnd, &format!("保存できません: {m}")) };
-                    return;
-                }
-                let state = unsafe { state_of::<ProfileEdit>(hwnd) };
-                if !state.is_null() {
-                    unsafe { (*state).accepted = true };
-                }
-                unsafe { DestroyWindow(hwnd) };
-            }
-            IDCANCEL => unsafe {
-                DestroyWindow(hwnd);
-            },
-            _ => {}
-        }
-    }
-
-    /// Opens the action editor for `working.actions[index]`. Reads what the
-    /// modal call needs up front, then re-borrows the state afterwards
-    /// (see the aliasing note in pe_on_command).
-    fn edit_action(hwnd: HWND, index: usize) {
-        let state = unsafe { state_of::<ProfileEdit>(hwnd) };
-        if state.is_null() {
-            return;
-        }
-        let (ids, mut action) = {
-            let working = unsafe { &(*state).working };
-            (
-                working
-                    .actions
-                    .iter()
-                    .map(|a| a.id.clone())
-                    .collect::<Vec<String>>(),
-                working.actions[index].clone(),
-            )
-        };
-        if action_editor(hwnd, &mut action, &ids, index) {
-            let state = unsafe { state_of::<ProfileEdit>(hwnd) };
-            if !state.is_null() {
-                let state = unsafe { &mut *state };
-                state.working.actions[index] = action;
-                fill_actions(hwnd, &state.working.actions, Some(index));
-            }
-        }
-    }
-
-    unsafe extern "system" fn pe_wnd_proc(
-        hwnd: HWND,
-        msg: u32,
-        wparam: WPARAM,
-        lparam: LPARAM,
-    ) -> LRESULT {
-        unsafe {
-            match msg {
-                WM_NCCREATE => {
-                    SetWindowLongPtrW(
-                        hwnd,
-                        GWLP_USERDATA,
-                        create_param::<ProfileEdit>(lparam) as isize,
-                    );
-                    DefWindowProcW(hwnd, msg, wparam, lparam)
-                }
-                WM_CREATE => {
-                    // Font is borrowed from the owner window's state: the
-                    // profile editor's lpParam is ProfileEdit, so fetch the
-                    // font through the main state of the owner instead.
-                    let owner = GetWindow(hwnd, GW_OWNER);
-                    let font = {
-                        let s = state_of::<MainState>(owner);
-                        if s.is_null() {
-                            ptr::null_mut()
-                        } else {
-                            (*s).font
-                        }
-                    };
-                    let st = state_of::<ProfileEdit>(hwnd);
-                    control(hwnd, &ctl("STATIC", "名前", 12, 14, 60, 20, -1), font);
-                    control(
-                        hwnd,
-                        &Ctl {
-                            style: ES_AUTOHSCROLL as u32,
-                            ex: WS_EX_CLIENTEDGE,
-                            ..ctl(
-                                "EDIT",
-                                if st.is_null() {
-                                    ""
-                                } else {
-                                    &(*st).working.name
-                                },
-                                80,
-                                12,
-                                300,
-                                24,
-                                IDC_PE_NAME,
-                            )
-                        },
-                        font,
-                    );
-                    control(hwnd, &ctl("STATIC", "ID", 392, 14, 30, 20, -1), font);
-                    control(
-                        hwnd,
-                        &Ctl {
-                            style: (ES_AUTOHSCROLL | ES_READONLY) as u32,
-                            ex: WS_EX_CLIENTEDGE,
-                            ..ctl(
-                                "EDIT",
-                                if st.is_null() { "" } else { &(*st).working.id },
-                                424,
-                                12,
-                                204,
-                                24,
-                                IDC_PE_ID,
-                            )
-                        },
-                        font,
-                    );
-                    control(
-                        hwnd,
-                        &ctl("STATIC", "アクション", 12, 46, 100, 20, -1),
-                        font,
-                    );
-                    control(
-                        hwnd,
-                        &Ctl {
-                            style: LBS_NOTIFY as u32 | WS_VSCROLL | WS_BORDER,
-                            ex: WS_EX_CLIENTEDGE,
-                            ..ctl("LISTBOX", "", 12, 68, 480, 300, IDC_PE_ACTIONS)
-                        },
-                        font,
-                    );
-                    let bx = 504;
-                    control(
-                        hwnd,
-                        &ctl("BUTTON", "追加", bx, 68, 124, 28, IDC_PE_ADD),
-                        font,
-                    );
-                    control(
-                        hwnd,
-                        &ctl("BUTTON", "編集", bx, 102, 124, 28, IDC_PE_EDIT),
-                        font,
-                    );
-                    control(
-                        hwnd,
-                        &ctl("BUTTON", "削除", bx, 136, 124, 28, IDC_PE_DEL),
-                        font,
-                    );
-                    control(
-                        hwnd,
-                        &ctl("BUTTON", "上へ", bx, 178, 124, 28, IDC_PE_UP),
-                        font,
-                    );
-                    control(
-                        hwnd,
-                        &ctl("BUTTON", "下へ", bx, 212, 124, 28, IDC_PE_DOWN),
-                        font,
-                    );
-                    control(
-                        hwnd,
-                        &ctl("BUTTON", "テスト実行", bx, 254, 124, 28, IDC_PE_TEST),
-                        font,
-                    );
-                    control(hwnd, &ctl("BUTTON", "OK", 384, 396, 120, 30, IDOK), font);
-                    control(
-                        hwnd,
-                        &ctl("BUTTON", "キャンセル", 512, 396, 116, 30, IDCANCEL),
-                        font,
-                    );
-                    if !st.is_null() {
-                        fill_actions(hwnd, &(*st).working.actions, None);
-                    }
-                    0
-                }
-                WM_COMMAND => {
-                    pe_on_command(hwnd, command_id(wparam), command_code(wparam));
-                    0
-                }
-                m if m == WM_TEST_DONE => {
-                    // Same forged-message guard as the main window's
-                    // WM_LAUNCH_DONE handler.
-                    if wparam == POST_MAGIC && lparam != 0 {
-                        let st = state_of::<ProfileEdit>(hwnd);
-                        if !st.is_null() {
-                            (*st).testing = false;
-                        }
-                        let (ok, text) = *Box::from_raw(lparam as *mut (bool, String));
-                        if ok {
-                            info_box(hwnd, &text);
-                        } else {
-                            error_box(hwnd, &text);
-                        }
-                    }
-                    0
-                }
-                WM_CLOSE => {
-                    DestroyWindow(hwnd);
-                    0
-                }
-                WM_DESTROY => {
-                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-                    0
-                }
-                _ => DefWindowProcW(hwnd, msg, wparam, lparam),
-            }
-        }
-    }
-
-    // ---------- action editor ----------
-
-    struct ActionEdit {
-        accepted: bool,
-        /// Action being built; committed back to the caller on OK.
-        action: Action,
-        /// Ids already used by other actions in the same profile.
-        other_ids: Vec<String>,
-    }
-
-    /// Opens the action editor modally; `action` holds the initial value and
-    /// receives the result on OK. `other_ids` are the ids the action must not
-    /// collide with; `self_index` is its position in the profile (or MAX for
-    /// a new action).
-    fn action_editor(
-        parent: HWND,
-        action: &mut Action,
-        other_ids: &[String],
-        self_index: usize,
-    ) -> bool {
-        let mut ids = other_ids.to_vec();
-        if self_index < ids.len() {
-            ids.remove(self_index);
-        }
-        let mut edit = ActionEdit {
-            accepted: false,
-            action: action.clone(),
-            other_ids: ids,
-        };
-        // SAFETY: same stack-context pattern as profile_editor.
-        let hwnd = unsafe {
-            let (x, y) = centered_rect(500, 350, parent);
-            CreateWindowExW(
-                WS_EX_DLGMODALFRAME,
-                wide(CLASS_ACTION_EDIT).as_ptr(),
-                wide("アクション編集").as_ptr(),
-                WS_POPUP | WS_CAPTION | WS_SYSMENU,
-                x,
-                y,
-                500,
-                350,
-                parent,
-                ptr::null_mut(),
-                GetModuleHandleW(ptr::null()),
-                &mut edit as *mut ActionEdit as *const c_void,
-            )
-        };
-        if hwnd.is_null() {
-            return false;
-        }
-        unsafe { modal(parent, hwnd) };
-        if edit.accepted {
-            *action = edit.action;
-        }
-        edit.accepted
-    }
-
-    fn kind_index(kind: &ActionKind) -> usize {
-        match kind {
-            ActionKind::Application { .. } => 0,
-            ActionKind::Folder { .. } => 1,
-            ActionKind::File { .. } => 2,
-            ActionKind::Url { .. } => 3,
-            ActionKind::Command { .. } => 4,
-            ActionKind::Wait { .. } => 5,
-        }
-    }
-
-    /// Which picker the 参照 button opens for a type, if any.
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Browse {
-        File,
-        Folder,
-    }
-
-    /// Which of the three generic fields a type uses, whether the shell
-    /// combo is relevant, and which picker the browse button opens. Labels
-    /// are set on the static controls.
-    fn field_layout(
-        type_index: usize,
-    ) -> (
-        Option<&'static str>,
-        Option<&'static str>,
-        Option<&'static str>,
-        bool,
-        Option<Browse>,
-    ) {
-        match type_index {
-            0 => (
-                Some("パス"),
-                Some("引数"),
-                Some("作業フォルダ (省略可)"),
-                false,
-                Some(Browse::File),
-            ),
-            1 => (
-                Some("フォルダのパス"),
-                None,
-                None,
-                false,
-                Some(Browse::Folder),
-            ),
-            2 => (
-                Some("ファイルのパス"),
-                None,
-                None,
-                false,
-                Some(Browse::File),
-            ),
-            3 => (Some("URL"), None, None, false, None),
-            4 => (Some("コマンド"), None, None, true, None),
-            5 => (Some("待機時間 (ms)"), None, None, false, None),
-            _ => (None, None, None, false, None),
-        }
-    }
-
-    /// Shows/enables the field set for the selected type and fills it from
-    /// the current action when the type still matches.
-    unsafe fn ae_apply_type(hwnd: HWND, keep_fields: bool) {
-        let type_index =
-            unsafe { SendMessageW(GetDlgItem(hwnd, IDC_AE_TYPE), CB_GETCURSEL, 0, 0) } as usize;
-        let (l1, l2, l3, shell, browse) = field_layout(type_index);
-        for (label_id, field_id, label) in [
-            (IDC_AE_L1, IDC_AE_F1, l1),
-            (IDC_AE_L2, IDC_AE_F2, l2),
-            (IDC_AE_L3, IDC_AE_F3, l3),
-        ] {
-            match label {
-                Some(text) => {
-                    set_text(hwnd, label_id, text);
-                    set_item_visible(hwnd, label_id, true);
-                    set_item_visible(hwnd, field_id, true);
-                    set_item_enabled(hwnd, field_id, true);
-                }
-                None => {
-                    set_item_visible(hwnd, label_id, false);
-                    set_item_visible(hwnd, field_id, false);
-                }
-            }
-        }
-        set_item_visible(hwnd, IDC_AE_LS, shell);
-        set_item_visible(hwnd, IDC_AE_SHELL, shell);
-        set_item_visible(hwnd, IDC_AE_BROWSE, browse.is_some());
-        if !keep_fields {
-            for id in [IDC_AE_F1, IDC_AE_F2, IDC_AE_F3] {
-                set_text(hwnd, id, "");
-            }
-        }
-    }
-
-    /// Builds the ActionKind for `type_index` from the dialog fields.
-    fn build_kind(hwnd: HWND, type_index: usize) -> Result<ActionKind, String> {
-        let f1 = dlg_text(hwnd, IDC_AE_F1);
-        match type_index {
-            0 => Ok(ActionKind::Application {
-                path: f1,
-                arguments: dlg_text(hwnd, IDC_AE_F2),
-                working_directory: {
-                    let d = dlg_text(hwnd, IDC_AE_F3);
-                    if d.is_empty() { None } else { Some(d) }
-                },
-            }),
-            1 => Ok(ActionKind::Folder { path: f1 }),
-            2 => Ok(ActionKind::File { path: f1 }),
-            3 => Ok(ActionKind::Url { url: f1 }),
-            4 => {
-                let shell_index =
-                    unsafe { SendMessageW(GetDlgItem(hwnd, IDC_AE_SHELL), CB_GETCURSEL, 0, 0) };
-                let shell = if shell_index == 1 {
-                    CommandShell::PowerShell
-                } else {
-                    CommandShell::Cmd
-                };
-                Ok(ActionKind::Command { shell, command: f1 })
-            }
-            5 => f1
-                .trim()
-                .parse::<u64>()
-                .map(|milliseconds| ActionKind::Wait { milliseconds })
-                .map_err(|_| "待機時間はミリ秒の数値で入力してください。".to_string()),
-            _ => Err("不明な種類です。".to_string()),
-        }
-    }
-
-    unsafe fn ae_on_command(hwnd: HWND, id: i32, code: u32) {
-        let state = unsafe { state_of::<ActionEdit>(hwnd) };
-        if state.is_null() {
-            return;
-        }
-        let state = unsafe { &mut *state };
-        match id {
-            IDC_AE_TYPE if code == CBN_SELCHANGE => {
-                unsafe { ae_apply_type(hwnd, false) };
-            }
-            IDC_AE_BROWSE => {
-                let type_index =
-                    unsafe { SendMessageW(GetDlgItem(hwnd, IDC_AE_TYPE), CB_GETCURSEL, 0, 0) }
-                        as usize;
-                let picked = match field_layout(type_index).4 {
-                    Some(Browse::File) => unsafe {
-                        browse_file(
-                            hwnd,
-                            "実行ファイル (*.exe)\0*.exe\0すべてのファイル (*.*)\0*.*\0",
-                        )
-                    },
-                    Some(Browse::Folder) => unsafe {
-                        browse_folder(hwnd, "フォルダを選択してください")
-                    },
-                    None => None,
-                };
-                if let Some(path) = picked {
-                    set_text(hwnd, IDC_AE_F1, &path);
-                }
-            }
-            IDOK => {
-                let id_text = dlg_text(hwnd, IDC_AE_ID);
-                if id_text.is_empty() {
-                    unsafe { error_box(hwnd, "ID を入力してください。") };
-                    return;
-                }
-                if state.other_ids.contains(&id_text) {
-                    unsafe {
-                        error_box(
-                            hwnd,
-                            &format!("ID '{id_text}' はこのプロファイル内で使用済みです。"),
-                        )
-                    };
-                    return;
-                }
-                let type_index =
-                    unsafe { SendMessageW(GetDlgItem(hwnd, IDC_AE_TYPE), CB_GETCURSEL, 0, 0) }
-                        as usize;
-                let kind = match build_kind(hwnd, type_index) {
-                    Ok(k) => k,
-                    Err(m) => {
-                        unsafe { error_box(hwnd, &m) };
-                        return;
-                    }
-                };
-                let action = Action {
-                    id: id_text,
-                    disabled: unsafe {
-                        SendMessageW(GetDlgItem(hwnd, IDC_AE_DISABLED), BM_GETCHECK, 0, 0)
-                    } == BST_CHECKED as isize,
-                    kind,
-                };
-                // Per-action rules (empty path, bad URL scheme, wait bound).
-                if let Err(m) = config::validate_action(&action) {
-                    unsafe { error_box(hwnd, &format!("保存できません: {m}")) };
-                    return;
-                }
-                state.action = action;
-                state.accepted = true;
-                unsafe { DestroyWindow(hwnd) };
-            }
-            IDCANCEL => unsafe {
-                DestroyWindow(hwnd);
-            },
-            _ => {}
-        }
-    }
-
-    unsafe extern "system" fn ae_wnd_proc(
-        hwnd: HWND,
-        msg: u32,
-        wparam: WPARAM,
-        lparam: LPARAM,
-    ) -> LRESULT {
-        unsafe {
-            match msg {
-                WM_NCCREATE => {
-                    SetWindowLongPtrW(
-                        hwnd,
-                        GWLP_USERDATA,
-                        create_param::<ActionEdit>(lparam) as isize,
-                    );
-                    DefWindowProcW(hwnd, msg, wparam, lparam)
-                }
-                WM_CREATE => {
-                    let owner = GetWindow(hwnd, GW_OWNER);
-                    // The owner is the profile editor; its own owner holds
-                    // the font. Walk up once more for the MainState.
-                    let grand = if owner.is_null() {
-                        ptr::null_mut()
-                    } else {
-                        GetWindow(owner, GW_OWNER)
-                    };
-                    let font = {
-                        let s = state_of::<MainState>(grand);
-                        if s.is_null() {
-                            ptr::null_mut()
-                        } else {
-                            (*s).font
-                        }
-                    };
-                    let st = state_of::<ActionEdit>(hwnd);
-
-                    control(hwnd, &ctl("STATIC", "ID", 12, 14, 60, 20, -1), font);
-                    control(
-                        hwnd,
-                        &Ctl {
-                            style: ES_AUTOHSCROLL as u32,
-                            ex: WS_EX_CLIENTEDGE,
-                            ..ctl(
-                                "EDIT",
-                                if st.is_null() { "" } else { &(*st).action.id },
-                                80,
-                                12,
-                                200,
-                                24,
-                                IDC_AE_ID,
-                            )
-                        },
-                        font,
-                    );
-                    control(hwnd, &ctl("STATIC", "種類", 292, 14, 50, 20, -1), font);
-                    let combo = control(
-                        hwnd,
-                        &Ctl {
-                            style: CBS_DROPDOWNLIST as u32 | WS_VSCROLL,
-                            ..ctl("COMBOBOX", "", 344, 10, 140, 200, IDC_AE_TYPE)
-                        },
-                        font,
-                    );
-                    for name in TYPE_NAMES {
-                        let w = wide(name);
-                        SendMessageW(combo, CB_ADDSTRING, 0, w.as_ptr() as LPARAM);
-                    }
-                    control(
-                        hwnd,
-                        &Ctl {
-                            style: BS_AUTOCHECKBOX as u32,
-                            ..ctl(
-                                "BUTTON",
-                                "無効 (このアクションをスキップ)",
-                                12,
-                                46,
-                                300,
-                                22,
-                                IDC_AE_DISABLED,
-                            )
-                        },
-                        font,
-                    );
-                    control(hwnd, &ctl("STATIC", "", 12, 82, 160, 20, IDC_AE_L1), font);
-                    control(
-                        hwnd,
-                        &Ctl {
-                            style: ES_AUTOHSCROLL as u32,
-                            ex: WS_EX_CLIENTEDGE,
-                            ..ctl("EDIT", "", 12, 104, 472, 24, IDC_AE_F1)
-                        },
-                        font,
-                    );
-                    control(hwnd, &ctl("STATIC", "", 12, 138, 160, 20, IDC_AE_L2), font);
-                    control(
-                        hwnd,
-                        &Ctl {
-                            style: ES_AUTOHSCROLL as u32,
-                            ex: WS_EX_CLIENTEDGE,
-                            ..ctl("EDIT", "", 12, 160, 472, 24, IDC_AE_F2)
-                        },
-                        font,
-                    );
-                    control(hwnd, &ctl("STATIC", "", 12, 194, 160, 20, IDC_AE_L3), font);
-                    control(
-                        hwnd,
-                        &Ctl {
-                            style: ES_AUTOHSCROLL as u32,
-                            ex: WS_EX_CLIENTEDGE,
-                            ..ctl("EDIT", "", 12, 216, 472, 24, IDC_AE_F3)
-                        },
-                        font,
-                    );
-                    // The shell controls sit on the L2/F2 row: that row is
-                    // only visible for the application type, which never
-                    // shows the shell combo, while the command type that
-                    // needs it leaves the row free. Placing them on the
-                    // F1 row would overlap the コマンド label.
-                    control(
-                        hwnd,
-                        &ctl("STATIC", "シェル", 12, 138, 60, 20, IDC_AE_LS),
-                        font,
-                    );
-                    control(
-                        hwnd,
-                        &ctl("BUTTON", "参照...", 370, 80, 114, 22, IDC_AE_BROWSE),
-                        font,
-                    );
-                    let shell_combo = control(
-                        hwnd,
-                        &Ctl {
-                            style: CBS_DROPDOWNLIST as u32 | WS_VSCROLL,
-                            ..ctl("COMBOBOX", "", 80, 136, 140, 160, IDC_AE_SHELL)
-                        },
-                        font,
-                    );
-                    for name in SHELL_NAMES {
-                        let w = wide(name);
-                        SendMessageW(shell_combo, CB_ADDSTRING, 0, w.as_ptr() as LPARAM);
-                    }
-                    SendMessageW(shell_combo, CB_SETCURSEL, 0, 0);
-                    control(hwnd, &ctl("BUTTON", "OK", 240, 268, 110, 30, IDOK), font);
-                    control(
-                        hwnd,
-                        &ctl("BUTTON", "キャンセル", 360, 268, 110, 30, IDCANCEL),
-                        font,
-                    );
-
-                    if !st.is_null() {
-                        let a = &(*st).action;
-                        SendMessageW(combo, CB_SETCURSEL, kind_index(&a.kind), 0);
-                        // Fill the generic fields from the current kind.
-                        match &a.kind {
-                            ActionKind::Application {
-                                path,
-                                arguments,
-                                working_directory,
-                            } => {
-                                set_text(hwnd, IDC_AE_F1, path);
-                                set_text(hwnd, IDC_AE_F2, arguments);
-                                if let Some(d) = working_directory {
-                                    set_text(hwnd, IDC_AE_F3, d);
-                                }
-                            }
-                            ActionKind::Folder { path } | ActionKind::File { path } => {
-                                set_text(hwnd, IDC_AE_F1, path)
-                            }
-                            ActionKind::Url { url } => set_text(hwnd, IDC_AE_F1, url),
-                            ActionKind::Command { shell, command } => {
-                                set_text(hwnd, IDC_AE_F1, command);
-                                SendMessageW(
-                                    shell_combo,
-                                    CB_SETCURSEL,
-                                    match shell {
-                                        CommandShell::Cmd => 0,
-                                        CommandShell::PowerShell => 1,
-                                    },
-                                    0,
-                                );
-                            }
-                            ActionKind::Wait { milliseconds } => {
-                                set_text(hwnd, IDC_AE_F1, &milliseconds.to_string())
-                            }
-                        }
-                        if a.disabled {
-                            SendMessageW(
-                                GetDlgItem(hwnd, IDC_AE_DISABLED),
-                                BM_SETCHECK,
-                                BST_CHECKED as usize,
-                                0,
-                            );
-                        }
-                    }
-                    ae_apply_type(hwnd, true);
-                    0
-                }
-                WM_COMMAND => {
-                    ae_on_command(hwnd, command_id(wparam), command_code(wparam));
-                    0
-                }
-                WM_CLOSE => {
-                    DestroyWindow(hwnd);
-                    0
-                }
-                WM_DESTROY => {
-                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-                    0
-                }
-                _ => DefWindowProcW(hwnd, msg, wparam, lparam),
-            }
-        }
-    }
-
-    // ---------- entry ----------
-
-    fn register_class(name: &str, proc: WNDPROC) -> Result<(), GuiError> {
-        // SAFETY: standard class registration; the window proc outlives the
-        // class and the background uses the stock window color.
-        unsafe {
-            let class_name = wide(name);
-            let wc = WNDCLASSW {
-                style: 0,
-                lpfnWndProc: proc,
-                cbClsExtra: 0,
-                cbWndExtra: 0,
-                hInstance: GetModuleHandleW(ptr::null()),
-                hIcon: LoadIconW(ptr::null_mut(), IDI_APPLICATION),
-                hCursor: LoadCursorW(ptr::null_mut(), IDC_ARROW),
-                hbrBackground: (COLOR_WINDOW as usize + 1) as HBRUSH,
-                lpszMenuName: ptr::null(),
-                lpszClassName: class_name.as_ptr(),
-            };
-            if RegisterClassW(&wc) == 0 {
-                return Err(win32("RegisterClassW"));
-            }
-            Ok(())
-        }
-    }
-
-    pub fn run() -> Result<(), GuiError> {
-        // Load config; a missing file offers to start from an empty one.
-        let config_path = config::config_path().map_err(GuiError::Config)?;
-        // Snapshot the mtime before reading so save_config can later detect
-        // an external edit; a missing file stays None (the new-config path
-        // below is then treated as "file did not exist").
-        let config_mtime = std::fs::metadata(&config_path)
-            .and_then(|m| m.modified())
-            .ok();
-        let config = match Config::load(&config_path) {
-            Ok(c) => c,
-            Err(e) => {
-                let missing = matches!(
-                    &e,
-                    ConfigError::Io { source, .. }
-                        if source.kind() == std::io::ErrorKind::NotFound
-                );
-                if !missing {
-                    // With windows_subsystem = "windows" there is no console
-                    // to print to: returning the Err silently would make an
-                    // Explorer double-click look like the app did nothing.
-                    let text = wide(&format!("設定ファイルを読み込めません。\r\n{e}"));
-                    let title = wide("Project Launcher");
-                    // SAFETY: static strings, NUL-terminated by `wide`.
-                    unsafe {
-                        MessageBoxW(
-                            ptr::null_mut(),
-                            text.as_ptr(),
-                            title.as_ptr(),
-                            MB_ICONERROR | MB_OK,
-                        )
-                    };
-                    return Err(GuiError::Config(e));
-                }
-                let text = wide(&format!(
-                    "設定ファイルが見つかりません。\r\n{}\r\n\r\n新規作成しますか?",
-                    config_path.display()
-                ));
-                let title = wide("Project Launcher");
-                // SAFETY: static strings, NUL-terminated.
-                let r = unsafe {
-                    MessageBoxW(
-                        ptr::null_mut(),
-                        text.as_ptr(),
-                        title.as_ptr(),
-                        MB_ICONQUESTION | MB_YESNO,
-                    )
-                };
-                if r != IDYES {
-                    return Err(GuiError::Config(e));
-                }
-                Config {
-                    version: config::CURRENT_CONFIG_VERSION,
-                    profiles: Vec::new(),
-                }
-            }
-        };
-
-        register_class(CLASS_MAIN, Some(main_wnd_proc))?;
-        register_class(CLASS_PROFILE_EDIT, Some(pe_wnd_proc))?;
-        register_class(CLASS_ACTION_EDIT, Some(ae_wnd_proc))?;
-
-        let font = message_font();
-        let mut state = MainState {
-            config,
-            config_path,
-            config_mtime,
-            running: false,
-            font,
-        };
-
-        // SAFETY: `state` lives on this stack frame for the whole message
-        // loop; the window clears GWLP_USERDATA on WM_DESTROY.
-        let hwnd = unsafe {
-            let (x, y) = centered_rect(576, 460, ptr::null_mut());
-            CreateWindowExW(
-                0,
-                wide(CLASS_MAIN).as_ptr(),
-                wide("Project Launcher").as_ptr(),
-                WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-                x,
-                y,
-                576,
-                460,
-                ptr::null_mut(),
-                ptr::null_mut(),
-                GetModuleHandleW(ptr::null()),
-                &mut state as *mut MainState as *const c_void,
-            )
-        };
-        if hwnd.is_null() {
-            // The normal DeleteObject below is unreachable on this path, so
-            // release the font here instead of leaking the GDI object.
-            if !font.is_null() {
-                unsafe { DeleteObject(font) };
-            }
-            return Err(win32("CreateWindowExW"));
-        }
-
-        unsafe {
-            ShowWindow(hwnd, SW_SHOW);
-            UpdateWindow(hwnd);
-            let mut msg: MSG = zeroed();
-            while GetMessageW(&mut msg, ptr::null_mut(), 0, 0) > 0 {
-                TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
-            if !font.is_null() {
-                DeleteObject(font);
-            }
-            // Balance the RegisterClassW calls above. Failures are ignored:
-            // the process is exiting anyway, and no windows remain.
-            for name in [CLASS_MAIN, CLASS_PROFILE_EDIT, CLASS_ACTION_EDIT] {
-                UnregisterClassW(wide(name).as_ptr(), GetModuleHandleW(ptr::null()));
-            }
-        }
-        Ok(())
+        CreateFontIndirectW(&ncm.lfMessageFont) as usize
     }
 }
 
-#[cfg(windows)]
-pub use imp::run;
+unsafe fn build(hwnd: HWND, font: usize) {
+    for &(class, text, style, x, y, w, h, id) in CONTROLS {
+        let (c, t) = (wide(class), wide(text));
+        unsafe {
+            let ctl = CreateWindowExW(
+                0,
+                c.as_ptr(),
+                t.as_ptr(),
+                WS_CHILD | WS_VISIBLE | style,
+                x,
+                y,
+                w,
+                h,
+                hwnd,
+                id as usize as HMENU,
+                null_mut(),
+                null(),
+            );
+            SendMessageW(ctl, WM_SETFONT, font, 1);
+        }
+    }
+    for k in KIND_LABELS {
+        let w = wide(k);
+        send(hwnd, ID_KIND, CB_ADDSTRING, 0, w.as_ptr() as LPARAM);
+    }
+    for s in ["cmd", "PowerShell"] {
+        let w = wide(s);
+        send(hwnd, ID_SHELL, CB_ADDSTRING, 0, w.as_ptr() as LPARAM);
+    }
+    set_combo(hwnd, ID_KIND, 0);
+    set_combo(hwnd, ID_SHELL, 0);
+    let stops = [56i32]; // dialog units: kind column, then detail
+    send(hwnd, ID_STEPS, LB_SETTABSTOPS, 1, stops.as_ptr() as LPARAM);
+}
+
+// ---- control helpers -------------------------------------------------------
+
+fn item(h: HWND, id: i32) -> HWND {
+    unsafe { GetDlgItem(h, id) }
+}
+
+fn send(h: HWND, id: i32, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    unsafe { SendMessageW(item(h, id), msg, wp, lp) }
+}
+
+fn set_text(h: HWND, id: i32, s: &str) {
+    let w = wide(s);
+    unsafe { SetDlgItemTextW(h, id, w.as_ptr()) };
+}
+
+fn text(h: HWND, id: i32) -> String {
+    let c = item(h, id);
+    let n = unsafe { GetWindowTextLengthW(c) }.max(0) as usize + 1;
+    let mut buf = vec![0u16; n];
+    unsafe { GetWindowTextW(c, buf.as_mut_ptr(), n as i32) };
+    from_wide(&buf)
+}
+
+fn status(h: HWND, s: &str) {
+    set_text(h, ID_STATUS, s);
+}
+
+fn list_sel(h: HWND, id: i32) -> Option<usize> {
+    usize::try_from(send(h, id, LB_GETCURSEL, 0, 0)).ok() // LB_ERR = -1
+}
+
+fn list_select(h: HWND, id: i32, i: usize) {
+    send(h, id, LB_SETCURSEL, i, 0);
+}
+
+fn list_fill(h: HWND, id: i32, rows: &[String], sel: Option<usize>) {
+    send(h, id, LB_RESETCONTENT, 0, 0);
+    for r in rows {
+        let w = wide(r);
+        send(h, id, LB_ADDSTRING, 0, w.as_ptr() as LPARAM);
+    }
+    list_select(h, id, sel.unwrap_or(usize::MAX)); // -1 clears
+}
+
+fn combo(h: HWND, id: i32) -> usize {
+    usize::try_from(send(h, id, CB_GETCURSEL, 0, 0)).unwrap_or(0)
+}
+
+fn set_combo(h: HWND, id: i32, i: usize) {
+    send(h, id, CB_SETCURSEL, i, 0);
+}
+
+fn checked(h: HWND, id: i32) -> bool {
+    send(h, id, BM_GETCHECK, 0, 0) == BST_CHECKED as LRESULT
+}
+
+fn set_check(h: HWND, id: i32, on: bool) {
+    send(h, id, BM_SETCHECK, if on { BST_CHECKED as WPARAM } else { 0 }, 0);
+}
+
+fn enable(h: HWND, id: i32, on: bool) {
+    unsafe { EnableWindow(item(h, id), on as i32) };
+}
+
+// ---- view <-> model --------------------------------------------------------
+
+fn step_row(s: &Step) -> String {
+    let detail = match &s.kind {
+        Kind::App { path, args, .. } if !args.is_empty() => format!("{path} {args}"),
+        Kind::App { path: t, .. } | Kind::Folder(t) | Kind::File(t) | Kind::Url(t) => t.clone(),
+        Kind::Cmd { ps, line } => format!("{}> {line}", if *ps { "PS" } else { "cmd" }),
+        Kind::Wait(ms) => format!("{ms} ms"),
+    };
+    let off = if s.off { "［無効］ " } else { "" };
+    format!("{}\t{off}{detail}", KIND_LABELS[s.kind.index()])
+}
+
+fn refresh_profiles(h: HWND) {
+    let Some((rows, cur)) = with(|a| (a.cfg.profiles.iter().map(|p| p.name.clone()).collect::<Vec<_>>(), a.cur))
+    else {
+        return;
+    };
+    set_text(h, ID_PHEAD, &format!("プロファイル（{}）", rows.len()));
+    list_fill(h, ID_PROFILES, &rows, cur);
+}
+
+fn show_profile(h: HWND) {
+    let (name, rows) = with(|a| {
+        let p = a.cur.and_then(|i| a.cfg.profiles.get(i))?;
+        Some((p.name.clone(), p.steps.iter().map(step_row).collect::<Vec<_>>()))
+    })
+    .flatten()
+    .unwrap_or_default();
+    set_text(h, ID_NAME, &name);
+    set_text(h, ID_SHEAD, &format!("ステップ（{}）", rows.len()));
+    list_fill(h, ID_STEPS, &rows, None);
+}
+
+/// Copies the name field into the current profile.
+fn commit_name(h: HWND) {
+    let name = text(h, ID_NAME);
+    let changed = with(|a| match a.cur.and_then(|i| a.cfg.profiles.get_mut(i)) {
+        Some(p) if p.name != name => {
+            p.name = name;
+            a.dirty = true;
+            true
+        }
+        _ => false,
+    });
+    if changed == Some(true) {
+        refresh_profiles(h);
+    }
+}
+
+fn kind_changed(h: HWND) {
+    let k = combo(h, ID_KIND).min(5);
+    set_text(h, ID_TLABEL, TARGET_LABELS[k]);
+    enable(h, ID_ARGS, k == 0);
+    enable(h, ID_DIR, k == 0);
+    enable(h, ID_SHELL, k == 4);
+    enable(h, ID_BROWSE, k <= 2);
+}
+
+/// Puts the selected step into the form.
+fn load_step(h: HWND) {
+    let Some(si) = list_sel(h, ID_STEPS) else { return };
+    let step = with(|a| a.cur.and_then(|i| a.cfg.profiles.get(i)).and_then(|p| p.steps.get(si)).cloned());
+    let Some(s) = step.flatten() else { return };
+    let (k, off) = (s.kind.index(), s.off);
+    let (target, args, dir, ps) = match s.kind {
+        Kind::App { path, args, dir } => (path, args, dir, false),
+        Kind::Folder(t) | Kind::File(t) | Kind::Url(t) => (t, String::new(), String::new(), false),
+        Kind::Cmd { ps, line } => (line, String::new(), String::new(), ps),
+        Kind::Wait(ms) => (ms.to_string(), String::new(), String::new(), false),
+    };
+    set_combo(h, ID_KIND, k);
+    set_combo(h, ID_SHELL, ps as usize);
+    set_text(h, ID_TARGET, &target);
+    set_text(h, ID_ARGS, &args);
+    set_text(h, ID_DIR, &dir);
+    set_check(h, ID_OFF, off);
+    kind_changed(h);
+}
+
+/// Builds a step from the form.
+fn read_step(h: HWND) -> Result<Step, String> {
+    let t = text(h, ID_TARGET).trim().to_string();
+    let kind = match combo(h, ID_KIND) {
+        0 => Kind::App { path: t, args: text(h, ID_ARGS), dir: text(h, ID_DIR).trim().to_string() },
+        1 => Kind::Folder(t),
+        2 => Kind::File(t),
+        3 => Kind::Url(t),
+        4 => Kind::Cmd { ps: combo(h, ID_SHELL) == 1, line: t },
+        _ => Kind::Wait(t.parse().map_err(|_| "待機時間はミリ秒の整数で入力してください".to_string())?),
+    };
+    let s = Step { off: checked(h, ID_OFF), kind };
+    config::check_step(&s)?;
+    Ok(s)
+}
+
+/// Applies `f(steps, selected)` to the current profile; `f` returns the row
+/// to select afterwards, or None when nothing changed.
+fn edit_steps(h: HWND, f: impl FnOnce(&mut Vec<Step>, Option<usize>) -> Option<usize>) {
+    let sel = list_sel(h, ID_STEPS);
+    let r = with(|a| {
+        let p = a.cur.and_then(|i| a.cfg.profiles.get_mut(i))?;
+        let n = f(&mut p.steps, sel)?;
+        a.dirty = true;
+        Some(n)
+    });
+    if let Some(n) = r.flatten() {
+        show_profile(h);
+        list_select(h, ID_STEPS, n);
+    }
+}
+
+// ---- commands --------------------------------------------------------------
+
+fn on_command(h: HWND, id: i32, code: u32) {
+    match (id, code) {
+        (ID_PROFILES, LBN_SELCHANGE) => {
+            let new = list_sel(h, ID_PROFILES);
+            commit_name(h);
+            with(|a| a.cur = new);
+            if let Some(n) = new {
+                list_select(h, ID_PROFILES, n);
+            }
+            show_profile(h);
+        }
+        (ID_PROFILES, LBN_DBLCLK) => run_selected(h),
+        (ID_STEPS, LBN_SELCHANGE) => load_step(h),
+        (ID_KIND, CBN_SELCHANGE) => kind_changed(h),
+        (_, CLICKED) => match id {
+            ID_OK => commit_name(h),
+            ID_NEW => new_profile(h),
+            ID_PDEL => delete_profile(h),
+            ID_RUN => run_selected(h),
+            ID_SHORTCUT => shortcut(h),
+            ID_BROWSE => browse(h),
+            ID_ADD | ID_SET => match read_step(h) {
+                Err(e) => status(h, &e),
+                Ok(s) if id == ID_ADD => edit_steps(h, |v, _| {
+                    v.push(s);
+                    Some(v.len() - 1)
+                }),
+                Ok(s) => edit_steps(h, |v, sel| {
+                    let i = sel?;
+                    *v.get_mut(i)? = s;
+                    Some(i)
+                }),
+            },
+            ID_SDEL => edit_steps(h, |v, sel| {
+                let i = sel.filter(|&i| i < v.len())?;
+                v.remove(i);
+                Some(i.min(v.len().saturating_sub(1)))
+            }),
+            ID_UP => edit_steps(h, |v, sel| {
+                let i = sel.filter(|&i| i > 0 && i < v.len())?;
+                v.swap(i, i - 1);
+                Some(i - 1)
+            }),
+            ID_DOWN => edit_steps(h, |v, sel| {
+                let i = sel.filter(|&i| i + 1 < v.len())?;
+                v.swap(i, i + 1);
+                Some(i + 1)
+            }),
+            ID_AUTO => {
+                let on = checked(h, ID_AUTO);
+                match win::set_autostart(on) {
+                    Ok(()) => status(h, if on { "Windows 起動時に常駐します" } else { "自動起動を解除しました" }),
+                    Err(e) => {
+                        set_check(h, ID_AUTO, !on);
+                        status(h, &e);
+                    }
+                }
+            }
+            ID_SAVE => {
+                save(h);
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+}
+
+fn new_profile(h: HWND) {
+    commit_name(h);
+    let id = match win::new_guid() {
+        Ok(id) => id,
+        Err(e) => return status(h, &e),
+    };
+    with(|a| {
+        a.cfg.profiles.push(Profile { id, name: "新しいプロファイル".into(), steps: Vec::new() });
+        a.cur = Some(a.cfg.profiles.len() - 1);
+        a.dirty = true;
+    });
+    refresh_profiles(h);
+    show_profile(h);
+    unsafe { SetFocus(item(h, ID_NAME)) };
+    send(h, ID_NAME, EM_SETSEL, 0, -1);
+}
+
+fn delete_profile(h: HWND) {
+    commit_name(h);
+    let target = with(|a| a.cur.and_then(|i| a.cfg.profiles.get(i).map(|p| (i, p.name.clone()))));
+    let Some((i, name)) = target.flatten() else { return };
+    if win::message(h, &format!("「{name}」を削除しますか？"), MB_YESNO | MB_ICONWARNING) != IDYES {
+        return;
+    }
+    with(|a| {
+        if i < a.cfg.profiles.len() {
+            a.cfg.profiles.remove(i);
+        }
+        a.cur = None;
+        a.dirty = true;
+    });
+    refresh_profiles(h);
+    show_profile(h);
+}
+
+/// Runs the profile as shown (saved or not) on a background thread.
+fn run_selected(h: HWND) {
+    commit_name(h);
+    let Some(p) = with(|a| a.cur.and_then(|i| a.cfg.profiles.get(i)).cloned()).flatten() else { return };
+    let name = p.name.clone();
+    let hwnd = h as usize;
+    let spawned = std::thread::Builder::new().spawn(move || {
+        let report = run::run_profile(&p);
+        DONE.lock().unwrap_or_else(|e| e.into_inner()).push(run::summary(&p, &report));
+        unsafe { PostMessageW(hwnd as HWND, WM_DONE, 0, 0) };
+    });
+    match spawned {
+        Ok(_) => status(h, &format!("実行中: {name}")),
+        Err(e) => status(h, &e.to_string()),
+    }
+}
+
+fn shortcut(h: HWND) {
+    commit_name(h);
+    let Some((p, dirty)) = with(|a| a.cur.and_then(|i| a.cfg.profiles.get(i)).cloned().map(|p| (p, a.dirty))).flatten()
+    else {
+        return;
+    };
+    if dirty {
+        return status(h, "ショートカットを作る前に保存してください");
+    }
+    let cmd = unsafe {
+        let menu = CreatePopupMenu();
+        if menu.is_null() {
+            return;
+        }
+        let (desk, start) = (wide("デスクトップ"), wide("スタートメニュー"));
+        AppendMenuW(menu, MF_STRING, 1, desk.as_ptr());
+        AppendMenuW(menu, MF_STRING, 2, start.as_ptr());
+        let mut rc: RECT = std::mem::zeroed();
+        GetWindowRect(item(h, ID_SHORTCUT), &mut rc);
+        let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, rc.left, rc.bottom, 0, h, null());
+        DestroyMenu(menu);
+        cmd
+    };
+    if cmd != 0 {
+        match win::create_shortcut(&p, cmd == 2) {
+            Ok(path) => status(h, &format!("作成しました: {}", path.display())),
+            Err(e) => status(h, &e),
+        }
+    }
+}
+
+fn browse(h: HWND) {
+    let picked = match combo(h, ID_KIND) {
+        0 => browse_file(h, "プログラム\0*.exe;*.bat;*.cmd;*.lnk\0すべてのファイル\0*.*\0"),
+        1 => browse_folder(h),
+        _ => browse_file(h, "すべてのファイル\0*.*\0"),
+    };
+    if let Some(p) = picked {
+        set_text(h, ID_TARGET, &p);
+    }
+}
+
+fn browse_file(h: HWND, filter: &str) -> Option<String> {
+    let filter = wide(filter); // ends in "\0\0" as required
+    let mut buf = vec![0u16; 1024];
+    let mut ofn: OPENFILENAMEW = unsafe { std::mem::zeroed() };
+    ofn.lStructSize = size_of::<OPENFILENAMEW>() as u32;
+    ofn.hwndOwner = h;
+    ofn.lpstrFilter = filter.as_ptr();
+    ofn.lpstrFile = buf.as_mut_ptr();
+    ofn.nMaxFile = buf.len() as u32;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
+    let ok = unsafe { GetOpenFileNameW(&mut ofn) } != 0;
+    ok.then(|| from_wide(&buf))
+}
+
+fn browse_folder(h: HWND) -> Option<String> {
+    let mut display = [0u16; 260];
+    let mut path = [0u16; 260];
+    unsafe {
+        let mut bi: BROWSEINFOW = std::mem::zeroed();
+        bi.hwndOwner = h;
+        bi.pszDisplayName = display.as_mut_ptr();
+        bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+        let pidl = SHBrowseForFolderW(&bi);
+        if pidl.is_null() {
+            return None;
+        }
+        let ok = SHGetPathFromIDListW(pidl, path.as_mut_ptr());
+        CoTaskMemFree(pidl as *const c_void);
+        (ok != 0).then(|| from_wide(&path))
+    }
+}
+
+/// Saves after checking nobody else changed the file since it was read.
+fn save(h: HWND) -> bool {
+    commit_name(h);
+    let Some((cfg, path, known)) = with(|a| (a.cfg.clone(), a.path.clone(), a.mtime)) else { return false };
+    if config::mtime(&path) != known
+        && win::message(h, "設定ファイルが外部で変更されています。上書きしますか？", MB_YESNO | MB_ICONWARNING) != IDYES
+    {
+        return false;
+    }
+    if let Err(e) = cfg.save(&path) {
+        status(h, "保存できませんでした");
+        win::message(h, &format!("保存できません。\n{e}"), MB_OK | MB_ICONERROR);
+        return false;
+    }
+    with(|a| {
+        a.dirty = false;
+        a.mtime = config::mtime(&a.path);
+    });
+    status(h, "保存しました");
+    true
+}
+
+fn close(h: HWND) {
+    commit_name(h);
+    if with(|a| a.dirty) == Some(true) {
+        match win::message(h, "変更を保存しますか？", MB_YESNOCANCEL | MB_ICONQUESTION) {
+            IDYES if save(h) => {}
+            IDNO => {}
+            _ => return,
+        }
+    }
+    unsafe { DestroyWindow(h) };
+}
+
+// ---- painting --------------------------------------------------------------
+
+unsafe fn draw_button(d: &DRAWITEMSTRUCT) {
+    let Some(t) = THEME.get() else { return };
+    let primary = d.CtlID == ID_RUN as u32 || d.CtlID == ID_SAVE as u32;
+    let down = d.itemState & ODS_SELECTED != 0;
+    let (fill, edge, color) = match (primary, down) {
+        (true, false) => (t.accent, t.accent, PANEL),
+        (true, true) => (t.accent_down, t.accent_down, PANEL),
+        (false, false) => (t.panel, t.line, TEXT),
+        (false, true) => (t.line, t.line, TEXT),
+    };
+    let color = if d.itemState & ODS_DISABLED != 0 { MUTED } else { color };
+    let mut label = [0u16; 32];
+    unsafe {
+        FillRect(d.hDC, &d.rcItem, fill as HBRUSH);
+        FrameRect(d.hDC, &d.rcItem, edge as HBRUSH);
+        let old = SelectObject(d.hDC, t.font as HGDIOBJ);
+        SetBkMode(d.hDC, 1); // TRANSPARENT
+        SetTextColor(d.hDC, color);
+        let n = GetWindowTextW(d.hwndItem, label.as_mut_ptr(), label.len() as i32);
+        let mut rc = d.rcItem;
+        DrawTextW(d.hDC, label.as_ptr(), n, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        if d.itemState & ODS_FOCUS != 0 {
+            let r = &d.rcItem;
+            let inner = RECT { left: r.left + 3, top: r.top + 3, right: r.right - 3, bottom: r.bottom - 3 };
+            DrawFocusRect(d.hDC, &inner);
+        }
+        SelectObject(d.hDC, old);
+    }
+}
+
+unsafe extern "system" fn wnd_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    unsafe {
+        match msg {
+            WM_COMMAND => {
+                on_command(h, (wp & 0xFFFF) as i32, ((wp >> 16) & 0xFFFF) as u32);
+                0
+            }
+            WM_DONE => {
+                let done: Vec<String> = DONE.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect();
+                if !done.is_empty() {
+                    status(h, &done.join("  |  "));
+                }
+                0
+            }
+            WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => {
+                let Some(t) = THEME.get() else { return DefWindowProcW(h, msg, wp, lp) };
+                let dc = wp as HDC;
+                let field = msg != WM_CTLCOLORSTATIC;
+                SetBkColor(dc, if field { PANEL } else { BG });
+                SetTextColor(dc, if GetDlgCtrlID(lp as HWND) == ID_STATUS { SUB } else { TEXT });
+                (if field { t.panel } else { t.bg }) as LRESULT
+            }
+            WM_DRAWITEM => {
+                if lp != 0 {
+                    draw_button(&*(lp as *const DRAWITEMSTRUCT));
+                }
+                1
+            }
+            WM_CLOSE => {
+                close(h);
+                0
+            }
+            WM_DESTROY => {
+                PostQuitMessage(0);
+                0
+            }
+            _ => DefWindowProcW(h, msg, wp, lp),
+        }
+    }
+}
