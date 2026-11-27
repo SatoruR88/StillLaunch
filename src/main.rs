@@ -1,51 +1,109 @@
-//! Project Launcher.
+//! StillLaunch — run groups of apps, folders, files, URLs and commands from
+//! saved profiles (Windows).
 //!
-//! Exit codes:
-//!   0  all enabled actions were handed to Windows successfully, a profile
-//!      run request was forwarded to the resident, the resident exited
-//!      normally, or a resident was already running
-//!   1  one or more actions failed (partial or total profile failure)
-//!   2  usage error, config error, resident/IPC failure, or shortcut error
+//! Exit codes: 0 success, 1 some steps failed, 2 usage/config/system error.
 
-// GUI subsystem: double-clicking the exe must not open a console window.
-// Output (println!/eprintln!) still reaches the terminal when launched from
-// cmd/PowerShell, because the parent's std handles are inherited regardless
-// of subsystem. Test builds keep the console subsystem for the test harness.
+// No console window on double-click; output still reaches a parent console.
 #![cfg_attr(not(test), windows_subsystem = "windows")]
+#![cfg_attr(not(windows), allow(dead_code))]
 
-mod actions;
-mod args;
-mod autostart;
 mod config;
+mod json;
+#[cfg(windows)]
 mod gui;
-mod ipc;
-mod profile;
+#[cfg(windows)]
 mod resident;
-mod shortcut;
+#[cfg(windows)]
+mod run;
+#[cfg(windows)]
+mod win;
 
-use args::{Mode, ShortcutLocation};
-use profile::ActionStatus;
 use std::process::ExitCode;
 
+const USAGE: &str = "Usage:
+  ProjectLauncher.exe                         open the editor (also: --settings)
+  ProjectLauncher.exe --resident              start the tray resident
+  ProjectLauncher.exe --profile <GUID>        run a profile (via the resident if running)
+  ProjectLauncher.exe --shortcut <GUID> [desktop|startmenu|both]";
+
+#[derive(Debug, PartialEq)]
+enum Mode {
+    Editor,
+    Resident,
+    Profile(String),
+    /// (GUID, desktop, start menu)
+    Shortcut(String, bool, bool),
+}
+
+fn parse_args(args: &[String]) -> Result<Mode, String> {
+    let mut it = args.iter().map(String::as_str);
+    let mode = match it.next() {
+        None | Some("--settings") => Mode::Editor,
+        Some("--resident") => Mode::Resident,
+        Some(a) if flag(a, "--profile") => Mode::Profile(guid_value(a, "--profile", &mut it)?),
+        Some(a) if flag(a, "--shortcut") => {
+            let id = guid_value(a, "--shortcut", &mut it)?;
+            match it.next() {
+                None | Some("desktop") => Mode::Shortcut(id, true, false),
+                Some("startmenu") => Mode::Shortcut(id, false, true),
+                Some("both") => Mode::Shortcut(id, true, true),
+                Some(x) => return Err(format!("unknown shortcut location {x:?}")),
+            }
+        }
+        Some(a) => return Err(format!("unknown argument {a:?}")),
+    };
+    match it.next() {
+        Some(extra) => Err(format!("unexpected argument {extra:?}")),
+        None => Ok(mode),
+    }
+}
+
+/// `--name` or `--name=...`
+fn flag(arg: &str, name: &str) -> bool {
+    arg == name || arg.strip_prefix(name).is_some_and(|r| r.starts_with('='))
+}
+
+fn guid_value<'a>(arg: &'a str, name: &str, it: &mut impl Iterator<Item = &'a str>) -> Result<String, String> {
+    let v = match arg.strip_prefix(name).and_then(|r| r.strip_prefix('=')) {
+        Some(v) => v,
+        None => it.next().unwrap_or(""),
+    };
+    if config::is_guid(v) {
+        Ok(v.to_string())
+    } else {
+        Err(format!("{name} expects a GUID like {{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}}, got {v:?}"))
+    }
+}
+
+#[cfg(not(windows))]
 fn main() -> ExitCode {
-    let mode = match args::parse(std::env::args_os().skip(1)) {
-        Ok(mode) => mode,
+    eprintln!("StillLaunch runs on Windows only.");
+    ExitCode::from(2)
+}
+
+#[cfg(windows)]
+fn main() -> ExitCode {
+    let args: Result<Vec<String>, _> = std::env::args_os().skip(1).map(|a| a.into_string()).collect();
+    let mode = match args.map_err(|_| "arguments must be valid Unicode".to_string()).and_then(|a| parse_args(&a)) {
+        Ok(m) => m,
         Err(e) => {
-            eprintln!("error: {e}");
+            eprintln!("error: {e}\n\n{USAGE}");
             return ExitCode::from(2);
         }
     };
-    match mode {
-        Mode::Gui | Mode::Settings => run_gui(),
-        Mode::Resident => run_resident(),
+    let result = match mode {
+        Mode::Editor => gui::run().map(|()| 0),
+        Mode::Resident => resident::run().map(|started| {
+            if !started {
+                println!("A resident is already running.");
+            }
+            0
+        }),
         Mode::Profile(id) => run_profile(&id),
-        Mode::Shortcut { id, location } => run_shortcut(&id, location),
-    }
-}
-
-fn run_gui() -> ExitCode {
-    match gui::run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Mode::Shortcut(id, desktop, start_menu) => make_shortcuts(&id, desktop, start_menu),
+    };
+    match result {
+        Ok(code) => ExitCode::from(code),
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::from(2)
@@ -53,135 +111,81 @@ fn run_gui() -> ExitCode {
     }
 }
 
-/// Runs the resident until its window is closed. A second instance is not an
-/// error: the desired state (one resident running) already holds.
-fn run_resident() -> ExitCode {
-    match resident::run() {
-        Ok(()) => {
-            println!("Resident stopped.");
-            ExitCode::SUCCESS
+/// Hands the request to the resident when one is running, otherwise runs
+/// the profile in this process.
+#[cfg(windows)]
+fn run_profile(id: &str) -> Result<u8, String> {
+    match resident::forward(id) {
+        resident::Forward::Accepted => {
+            println!("Sent to the resident.");
+            return Ok(0);
         }
-        Err(resident::ResidentError::AlreadyRunning) => {
-            println!("A Project Launcher resident is already running.");
-            ExitCode::SUCCESS
+        resident::Forward::Rejected => {
+            return Err("the resident rejected the request (unknown profile, busy, or a different user/integrity level)".into());
         }
-        Err(e) => {
-            eprintln!("error: {e}");
-            ExitCode::from(2)
-        }
+        resident::Forward::NoResident => {}
     }
+    let cfg = config::load_default()?;
+    let p = cfg.find(id).ok_or_else(|| format!("no profile with id {id}"))?;
+    let report = run::run_profile(p);
+    println!("{}", run::summary(p, &report));
+    Ok(if report.iter().all(|(_, r)| r.is_ok()) { 0 } else { 1 })
 }
 
-/// Creates .lnk shortcuts for a profile. All requested locations are
-/// attempted so one failure still leaves the other location written.
-fn run_shortcut(id: &str, location: ShortcutLocation) -> ExitCode {
-    let config = match config::Config::load_default() {
-        Ok(config) => config,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::from(2);
-        }
-    };
-    let Some(profile) = profile::find_profile(&config, id) else {
-        eprintln!("error: no profile with id {id:?} in the config");
-        return ExitCode::from(2);
-    };
-
-    let locations: &[shortcut::ShortcutLocation] = match location {
-        ShortcutLocation::Desktop => &[shortcut::ShortcutLocation::Desktop],
-        ShortcutLocation::StartMenu => &[shortcut::ShortcutLocation::StartMenu],
-        ShortcutLocation::Both => &[
-            shortcut::ShortcutLocation::Desktop,
-            shortcut::ShortcutLocation::StartMenu,
-        ],
-    };
-
+#[cfg(windows)]
+fn make_shortcuts(id: &str, desktop: bool, start_menu: bool) -> Result<u8, String> {
+    let cfg = config::load_default()?;
+    let p = cfg.find(id).ok_or_else(|| format!("no profile with id {id}"))?;
     let mut failed = false;
-    for &loc in locations {
-        match shortcut::create(&profile.name, &profile.id, loc) {
-            Ok(path) => println!("Created {}", path.display()),
-            Err(e) => {
-                eprintln!("error: {e}");
-                failed = true;
+    for (wanted, in_start_menu) in [(desktop, false), (start_menu, true)] {
+        if wanted {
+            match win::create_shortcut(p, in_start_menu) {
+                Ok(path) => println!("Created {}", path.display()),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    failed = true;
+                }
             }
         }
     }
-    if failed {
-        ExitCode::from(2)
-    } else {
-        ExitCode::SUCCESS
-    }
+    Ok(if failed { 2 } else { 0 })
 }
 
-fn run_profile(id: &str) -> ExitCode {
-    // If a resident is running it owns profile execution: forward the
-    // request and exit. No resident means this process runs the profile
-    // directly (headless use stays fully supported).
-    #[cfg(windows)]
-    match ipc::forward_run_profile(id) {
-        Ok(ipc::ForwardOutcome::Delivered) => {
-            println!("Forwarded the run request for profile {id} to the resident.");
-            return ExitCode::SUCCESS;
-        }
-        Ok(ipc::ForwardOutcome::Rejected) => {
-            eprintln!(
-                "error: the resident rejected the request for profile {id} \
-                 (unknown profile id, or blocked by UIPI integrity levels)"
-            );
-            return ExitCode::from(2);
-        }
-        Ok(ipc::ForwardOutcome::NoResident) => {}
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::from(2);
-        }
-    }
-    run_profile_direct(id)
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn run_profile_direct(id: &str) -> ExitCode {
-    let config = match config::Config::load_default() {
-        Ok(config) => config,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::from(2);
-        }
-    };
-    let profile = match profile::find_profile(&config, id) {
-        Some(profile) => profile,
-        None => {
-            eprintln!("error: no profile with id {id:?} in the config");
-            return ExitCode::from(2);
-        }
-    };
+    const G: &str = "{11111111-2222-3333-4444-555555555555}";
 
-    println!("Running profile '{}' ({})", profile.name, profile.id);
-    let result = profile::execute_profile(profile, &mut |action| {
-        actions::execute(action).map_err(|e| e.to_string())
-    });
-
-    for outcome in &result.outcomes {
-        match &outcome.status {
-            ActionStatus::Succeeded => println!("  [ok]     {}", outcome.action_id),
-            ActionStatus::Failed(e) => println!("  [FAILED] {}: {e}", outcome.action_id),
-        }
-    }
-    if result.skipped_disabled > 0 {
-        println!("  ({} disabled action(s) skipped)", result.skipped_disabled);
+    fn p(a: &[&str]) -> Result<Mode, String> {
+        parse_args(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>())
     }
 
-    if result.is_success() {
-        println!(
-            "Profile finished: all {} action(s) succeeded.",
-            result.outcomes.len()
-        );
-        ExitCode::SUCCESS
-    } else {
-        println!(
-            "Profile finished: {} of {} action(s) failed.",
-            result.failure_count(),
-            result.outcomes.len()
-        );
-        ExitCode::from(1)
+    #[test]
+    fn parses_modes() {
+        assert_eq!(p(&[]).unwrap(), Mode::Editor);
+        assert_eq!(p(&["--settings"]).unwrap(), Mode::Editor);
+        assert_eq!(p(&["--resident"]).unwrap(), Mode::Resident);
+        assert_eq!(p(&["--profile", G]).unwrap(), Mode::Profile(G.into()));
+        assert_eq!(p(&[&format!("--profile={G}")]).unwrap(), Mode::Profile(G.into()));
+        assert_eq!(p(&["--shortcut", G]).unwrap(), Mode::Shortcut(G.into(), true, false));
+        assert_eq!(p(&["--shortcut", G, "startmenu"]).unwrap(), Mode::Shortcut(G.into(), false, true));
+        assert_eq!(p(&[&format!("--shortcut={G}"), "both"]).unwrap(), Mode::Shortcut(G.into(), true, true));
+    }
+
+    #[test]
+    fn rejects_bad_args() {
+        for bad in [
+            &["--profile"][..],
+            &["--profile", "abc"],
+            &["--profile="],
+            &["--profilex", G],
+            &["--bogus"],
+            &["--resident", "--settings"],
+            &["--shortcut", G, "somewhere"],
+            &["--shortcut", G, "desktop", "--resident"],
+        ] {
+            assert!(p(bad).is_err(), "{bad:?}");
+        }
     }
 }
