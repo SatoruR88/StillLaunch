@@ -2,8 +2,8 @@
 
 [English](#english) · [日本語](#日本語)
 
-> **Note:** this branch is a from-scratch rewrite (raw Win32, no serde) that has **not been compiled or tested on Windows yet**.
-> **注意:** このブランチは作り直したコード（Win32 直接・serde なし）で、**まだ Windows でビルド・動作確認していません**。
+> **Note:** this branch is a from-scratch rewrite (raw Win32, no serde) that builds without warnings (cross-compiled for `x86_64-pc-windows-gnu`, unit tests pass) but has **not been run on Windows yet**.
+> **注意:** このブランチは作り直したコード（Win32 直接・serde なし）で、ビルドは警告なしで通り単体テストも成功していますが（Windows 向けにクロスコンパイル）、**まだ Windows で動作確認していません**。
 
 ## English
 
